@@ -52,7 +52,7 @@ from email.utils import COMMASPACE, formatdate
 import warnings
 import TRIPPy
 import TRIPPy.XTOMO
-import bspline
+from gptools.splines import spev
 import itertools
 try:
     import PyGMO
@@ -703,7 +703,7 @@ class Run(object):
             else:
                 knotgrid_D = self.knotgrid_D
                 knotgrid_V = self.knotgrid_V
-            D = bspline.bspev(
+            D = spev(
                 knotgrid_D,
                 scipy.insert(eig_D, 0, eig_D[0]),
                 self.spline_k_D,
@@ -711,7 +711,7 @@ class Run(object):
             )
             # Hackishly attempt to prevent numerical issues with STRAHL:
             D[0] = D[1]
-            V = bspline.bspev(
+            V = spev(
                 knotgrid_V,
                 scipy.insert(eig_V, 0, 0.0),
                 self.spline_k_V,
