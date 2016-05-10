@@ -542,9 +542,9 @@ class Run(object):
         if not self.free_knots:
             if self.method == 'spline':
                 if knotgrid_D is None:
-                    knotgrid_D = scipy.linspace(0, 1.2, num_eig_D - self.spline_k_D + 2)
+                    knotgrid_D = scipy.linspace(0, roa_grid_DV[-1], num_eig_D - self.spline_k_D + 2)
                 if knotgrid_V is None:
-                    knotgrid_V = scipy.linspace(0, 1.2, num_eig_V - self.spline_k_D + 2)
+                    knotgrid_V = scipy.linspace(0, roa_grid_DV[-1], num_eig_V - self.spline_k_D + 2)
             elif self.method == 'linterp':
                 if knotgrid_D is None:
                     knotgrid_D = scipy.linspace(0, roa_grid_DV[-1], num_eig_D + 1)
@@ -988,6 +988,8 @@ class Run(object):
         # D_ub = 50.0  # was 50
         V_lb = -200.0
         V_ub = 200.0
+        # V_ub_outer = 0.0
+        V_ub_outer = V_ub
         V_lb_outer = -200.0
         # V_lb_outer = -1000.0  # was -1000
         # V_lb_outer = -500.0  # was -500
@@ -1006,7 +1008,7 @@ class Run(object):
             prior = gptools.UniformJointPrior(
                 [(D_lb, D_ub)] * self.num_eig_D +
                 [(V_lb, V_ub)] * (self.num_eig_V - 1) +
-                [(V_lb_outer, V_ub)]
+                [(V_lb_outer, V_ub_outer)]
             )
         if self.free_knots:
             if self.method == 'spline':
