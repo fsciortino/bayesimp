@@ -171,16 +171,16 @@ OPT_STATUS = {
     10: "bayesimp failure"
 }
 
-def test_lock(*args, **kwargs):
-    """Test the thread-safety of putting the lock in the module namespace.
-    
-    Looks like it works!
-    """
-    with DIR_POOL_LOCK:
-        time_.sleep(5)
-        print("done.")
-    
-    return 0
+# def test_lock(*args, **kwargs):
+#     """Test the thread-safety of putting the lock in the module namespace.
+#
+#     Looks like it works!
+#     """
+#     with DIR_POOL_LOCK:
+#         time_.sleep(5)
+#         print("done.")
+#
+#     return 0
 
 def get_idl_session():
     """Launch an IDL session and store it in the global variable IDL_SESSION.
@@ -547,9 +547,9 @@ class Run(object):
                     knotgrid_V = scipy.linspace(0, 1.2, num_eig_V - self.spline_k_D + 2)
             elif self.method == 'linterp':
                 if knotgrid_D is None:
-                    knotgrid_D = scipy.linspace(0, 1.2, num_eig_D + 1)
+                    knotgrid_D = scipy.linspace(0, roa_grid_DV[-1], num_eig_D + 1)
                 if knotgrid_V is None:
-                    knotgrid_V = scipy.linspace(0, 1.2, num_eig_V + 1)
+                    knotgrid_V = scipy.linspace(0, roa_grid_DV[-1], num_eig_V + 1)
             
             self.knotgrid_D = knotgrid_D
             self.knotgrid_V = knotgrid_V
@@ -5787,6 +5787,25 @@ class Run(object):
             f.write(contents)
         
         return contents
+    
+    def write_source(self, t, s):
+        """Write a STRAHL source file.
+        
+        Will overwrite whatever :py:attr:`self.source_file` is.
+        
+        Parameters
+        ----------
+        t : array of float, (`n`,)
+            The timebase (in seconds).
+        s : array of float, (`n`,)
+            The source function (in particles/s).
+        """
+        contents = '%d\n' % (len(t),)
+        for tv, sv in zip(t, s):
+            contents += '    %5.5f    %5.5e\n' % (tv, sv)
+        
+        with open(self.source_file, 'w') as f:
+            f.write(contents)
     
     def compute_view_data(self, debug_plots=False, write=True, contour_axis=None, **kwargs):
         """Compute the quadrature weights to line-integrate the emission profiles.
