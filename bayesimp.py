@@ -44,11 +44,6 @@ import tempfile
 import multiprocessing
 import emcee
 from emcee.interruptible_pool import InterruptiblePool
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
-from email.mime.multipart import MIMEMultipart
-from email.utils import COMMASPACE, formatdate
 import warnings
 import TRIPPy
 import TRIPPy.XTOMO
@@ -65,7 +60,7 @@ import lines
 import nlopt
 import pymysql as MS
 import traceback
-from connect import get_connection
+from connect import get_connection, send_email
 
 # Store the PID of the main thread:
 MAIN_PID = os.getpid()
@@ -181,6 +176,12 @@ OPT_STATUS = {
 #         print("done.")
 #
 #     return 0
+
+# POS vector for XEUS:
+XEUS_POS = [2.561, 0.2158, 0.196, 0.1136]
+
+# POS vector for LoWEUS:
+LOWEUS_POS = [2.561, -0.2158, 0.196, -0.1136]
 
 def get_idl_session():
     """Launch an IDL session and store it in the global variable IDL_SESSION.
@@ -470,6 +471,13 @@ class Run(object):
     sort_knots : bool
         If True, the knots will be sorted when splitting the params. Default is
         False (don't sort knots, unsorted knots are treated as infeasible cases).
+    params_true : array of float, optional
+        If provided, these are used to construct synthetic data (using the
+        equilibrium and temperature/density profiles from the specified shot).
+        Default is to use actual experimental data.
+    normalize : bool, optional
+        If True, normalized signals will be used when comparing to STRAHL output.
+        Default is True.
     """
     def __init__(
             self,
@@ -504,7 +512,9 @@ class Run(object):
             spline_k_V=3,
             include_loweus=False,
             use_scaling=False,
-            sort_knots=False
+            sort_knots=False,
+            params_true=None,
+            normalize=True
         ):
         
         global MASTER_DIR
@@ -523,8 +533,8 @@ class Run(object):
         self.injections = injections
         self.tht = tht
         self.line = line
-        self.Te_args = Te_args
-        self.ne_args = ne_args
+        # self.Te_args = Te_args
+        # self.ne_args = ne_args
         self.debug_plots = debug_plots
         
         self.include_loweus = include_loweus
@@ -533,6 +543,9 @@ class Run(object):
         self.sort_knots = sort_knots
         
         self.use_scaling = use_scaling
+        self.normalize = normalize
+        
+        self.params_true = params_true
         
         if method == 'spline':
             self.spline_k_D = spline_k_D
@@ -635,28 +648,45 @@ class Run(object):
         self.write_control()
         
         # Load run data into Python, save the processed data for later use:
-        print("Loading run data...")
+        print("Loading background profile data...")
         try:
             with open('run_data.pkl', 'rb') as f:
                 self.run_data = pkl.load(f)
-            print("Loaded run data from run_data.pkl.")
+            print("Loaded profile data from run_data.pkl.")
         except IOError:
-            self.run_data = RunData(self)
+            self.run_data = RunData(self.shot, self.time_1, self.time_2, self.roa_grid, Te_args, ne_args)
             with open('run_data.pkl', 'wb') as f:
                 pkl.dump(self.run_data, f, protocol=pkl.HIGHEST_PROTOCOL)
         
-        # Compute and store the view data:
-        if not os.path.isfile('view_data.pkl') or not os.path.isfile('xtomo_view_data.pkl'):
-            print("Finding view data...")
+        print("Loading signals...")
+        try:
+            with open('signals.pkl', 'rb') as f:
+                self.signals = pkl.load(f)
+            with open('ar_signal.pkl', 'rb') as f:
+                self.ar_signal = pkl.load(f)
+            print("Loaded signals from signals.pkl.")
+        except IOError:
+            self.signals = []
+            hirex_data = HirexData(self.injections, debug_plots=self.debug_plots)
+            self.signals.append(hirex_data.signal)
+            vuv_data = VUVData(self.shot, self.injections, debug_plots=self.debug_plots)
+            self.signals.append(vuv_data.signal)
+            xtomo_data = XTOMOData(self.shot, self.injections)
+            self.signals.append(xtomo_data.signal)
+            
+            ar_data = HirexData(self.injections, ar=True, debug_plots=self.debug_plots)
+            self.ar_signal = ar_data.signal
+            
+            # Compute the view data and store it directly in the Signal objects:
             self.compute_view_data()
-        else:
-            with open('view_data.pkl', 'rb') as f:
-                self.weights = pkl.load(f)
-            with open('ar_view_data.pkl', 'rb') as f:
-                self.ar_weights = pkl.load(f)
-            with open('xtomo_view_data.pkl', 'rb') as f:
-                self.xtomo_weights = pkl.load(f)
-            print("Loaded view data from view_data.pkl.")
+            
+            with open('signals.pkl', 'wb') as f:
+                pkl.dump(self.signals, f, protocol=pkl.HIGHEST_PROTOCOL)
+            with open('ar_signal.pkl', 'wb') as f:
+                pkl.dump(self.ar_signal, f, protocol=pkl.HIGHEST_PROTOCOL)
+            
+            # Write the atomdat file:
+            self.write_atomdat(vuv_data)
         
         self._PEC = None
         self.load_PEC()
@@ -846,17 +876,17 @@ class Run(object):
                         self.mu_D.num_free_params + self.k_V.num_free_params:
                     self.num_eig_D + self.num_eig_V + self.k_D.num_free_params +
                         self.mu_D.num_free_params + self.k_V.num_free_params +
-                        1 + self.run_data.vuv_signals_norm_combined.shape[0] +
+                        1 + self.signals[1].y.shape[1] +
                         len(
-                            [k for k in self.run_data.xtomo_sig.keys() if self.run_data.xtomo_sig[k] is not None]
+                            [k for k in (1, 3)]
                         )
                 ]
                 param_source = params[
                     self.num_eig_D + self.num_eig_V + self.k_D.num_free_params +
                         self.mu_D.num_free_params + self.k_V.num_free_params +
-                        1 + self.run_data.vuv_signals_norm_combined.shape[0] +
+                        1 + self.signals[1].y.shape[1] +
                         len(
-                            [k for k in self.run_data.xtomo_sig.keys() if self.run_data.xtomo_sig[k] is not None]
+                            [k for k in (1, 3)]
                         ):
                 ]
             else:
@@ -888,17 +918,17 @@ class Run(object):
                                 self.spline_k_D + self.num_eig_V - self.spline_k_V:
                             self.num_eig_D + self.num_eig_V + self.num_eig_D -
                                 self.spline_k_D + self.num_eig_V - self.spline_k_V +
-                                1 + self.run_data.vuv_signals_norm_combined.shape[0] +
+                                1 + self.signals[1].y.shape[1] +
                                 len(
-                                    [k for k in self.run_data.xtomo_sig.keys() if self.run_data.xtomo_sig[k] is not None]
+                                    [k for k in (1, 3)]
                                 )
                         ]
                         param_source = params[
                             self.num_eig_D + self.num_eig_V + self.num_eig_D -
                                 self.spline_k_D + self.num_eig_V - self.spline_k_V +
-                                1 + self.run_data.vuv_signals_norm_combined.shape[0] +
+                                1 + self.signals[1].y.shape[1] +
                                 len(
-                                    [k for k in self.run_data.xtomo_sig.keys() if self.run_data.xtomo_sig[k] is not None]
+                                    [k for k in (1, 3)]
                                 ):
                         ]
                     else:
@@ -923,17 +953,17 @@ class Run(object):
                                 self.num_eig_V - 1:
                             self.num_eig_D + self.num_eig_V + self.num_eig_D - 1 +
                                 self.num_eig_V - 1 +
-                                1 + self.run_data.vuv_signals_norm_combined.shape[0] +
+                                1 + self.signals[1].y.shape[1] +
                                 len(
-                                    [k for k in self.run_data.xtomo_sig.keys() if self.run_data.xtomo_sig[k] is not None]
+                                    [k for k in (1, 3)]
                                 )
                         ]
                         param_source = params[
                             self.num_eig_D + self.num_eig_V + self.num_eig_D - 1 +
                                 self.num_eig_V - 1 +
-                                1 + self.run_data.vuv_signals_norm_combined.shape[0] +
+                                1 + self.signals[1].y.shape[1] +
                                 len(
-                                    [k for k in self.run_data.xtomo_sig.keys() if self.run_data.xtomo_sig[k] is not None]
+                                    [k for k in (1, 3)]
                                 ):
                         ]
                     else:
@@ -952,16 +982,16 @@ class Run(object):
                     param_scaling = params[
                         self.num_eig_D + self.num_eig_V:
                         self.num_eig_D + self.num_eig_V +
-                            1 + self.run_data.vuv_signals_norm_combined.shape[0] +
+                            1 + self.signals[1].y.shape[1] +
                             len(
-                                [k for k in self.run_data.xtomo_sig.keys() if self.run_data.xtomo_sig[k] is not None]
+                                [k for k in (1, 3)]
                             )
                     ]
                     param_source = params[
                         self.num_eig_D + self.num_eig_V +
-                            1 + self.run_data.vuv_signals_norm_combined.shape[0] +
+                            1 + self.signals[1].y.shape[1] +
                             len(
-                                [k for k in self.run_data.xtomo_sig.keys() if self.run_data.xtomo_sig[k] is not None]
+                                [k for k in (1, 3)]
                             ):
                     ]
                 else:
@@ -1035,18 +1065,20 @@ class Run(object):
                     )
                 )
         
+        # TODO: This is hard-coded for just XTOMO 1 and 3! It should be
+        # generalized!
         if self.use_scaling:
             prior = prior * gptools.GammaJointPriorAlt(
                 [1.0] * (
-                    1 + self.run_data.vuv_signals_norm_combined.shape[0] +
+                    1 + self.signals[1].y.shape[1] +
                     len(
-                        [k for k in self.run_data.xtomo_sig.keys() if self.run_data.xtomo_sig[k] is not None]
+                        [k for k in (1, 3)]
                     )
                 ),
                 [0.1] * (
-                    1 + self.run_data.vuv_signals_norm_combined.shape[0] +
+                    1 + self.signals[1].y.shape[1] +
                     len(
-                        [k for k in self.run_data.xtomo_sig.keys() if self.run_data.xtomo_sig[k] is not None]
+                        [k for k in (1, 3)]
                     )
                 )
             )
@@ -1360,25 +1392,15 @@ class Run(object):
             time,
             steady_ar=None,
             debug_plots=False,
-            big_f=None,
-            a_H=None,
-            a_V=None,
-            f_xtomo=None,
-            a_xtomo=None,
-            ar_f=None,
-            ar_a=None,
-            label='_nolegend_',
-            lc='g',
-            alpha=1.0
         ):
         """Computes the diagnostic signals corresponding to the given local emissivities.
         
-        Returns a tuple of (`sbright`, `vbright`, `xtomobright`), where
-            - `sbright` is the HiReX-SR brightnesses.
-            - `vbright` is the VUV spectrometer brightness (with XEUS first).
-            - `xtomobright` is a dictionary of XTOMO brightnesses.
+        Takes each signal in :py:attr:`self.signals`, applies the weights (if
+        present), interpolates onto the correct timebase and (if appropriate)
+        normalizes the interpolated signal.
         
-        In all cases, the shapes are (`n_time`, `n_chan`).
+        Returns an array, `signals`, with one entry for each element in
+        :py:attr:`self.signals`. Each entry has shape (`n_time`, `n_chan`).
         
         Parameters
         ----------
@@ -1393,181 +1415,89 @@ class Run(object):
         debug_plots : bool, optional
             If True, plots of the various steps will be generated. Default is
             False (do not produce plots).
-        big_f : Figure instance, optional
-            The figure containing plots of each data source. If not present, a
-            new figure is created by calling :py:meth:`RunData.plot_data`.
-        a_H : list of Axes instances, optional
-            The axes from `big_f` which contain the HiReX-SR data.
-        a_V : list of Axes instances, optional
-            The axes from `big_f` which contain the VUV spectrometer data.
-        f_xtomo : dict of Figure instances, optional
-            The figures containing plots of each XTOMO system. If not present,
-            new figures are created by calling :py:meth:`RunData.plot_xtomo`.
-        a_xtomo : dict of lists of Axes instances, optional
-            The axes from `f_xtomo`.
-        ar_f : Figure instance, optional
-            The figure containing the argon data. If not present, a new figure
-            is created by calling :py:meth:`RunData.plot_ar`.
-        ar_a : Axes instance, optional
-            The axes from `ar_f` to plot the argon profile on.
-        label : str, optional
-            Label to use for lines added to existing figures. Default is
-            '_nolegend_'.
-        lc : str, optional
-            Line color to use for lines added to existing figures. Default is
-            None.
-        alpha : float, optional
-            Transparency to use for lines added to existing figures. Default is
-            1.0 (solid).
         """
         eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.split_params(params)
         
         time = time - self.time_1
-        time_s = time + param_source[0]
-        time_v = time + param_source[1]
-        time_xtomo = time + param_source[2]
+        # Apply the diagnostic time shifts:
+        times = [time - dt for dt in param_source[:len(self.signals)]]
         
         if steady_ar is None:
-            # Compute the HiReX-SR brightness:
-            sbright = self.weights[:self.run_data.hirex_pos.shape[0]].dot(
-                dlines[:, self.run_data.hirex_line_idx, :].T
-            ).T
-            
-            # Normalize the HiReX-SR signal:
-            sbright = sbright / sbright.max()
-            
-            # Compute the XEUS brightness:
-            xbright = []
-            for i in self.run_data.xeus_line_idxs:
-                xbright.append(
-                    self.weights[self.run_data.hirex_pos.shape[0]].dot(
-                        dlines[:, i, :].T
-                    )
-                )
-            xbright = scipy.vstack(xbright).T
-            
-            # Compute the LoWEUS brightness:
-            if self.run_data.loweus_line_idxs:
-                lbright = []
-                for i in self.run_data.loweus_line_idxs:
-                    lbright.append(
-                        self.weights[self.run_data.hirex_pos.shape[0] + 1].dot(
-                            dlines[:, i, :].T
-                        )
-                    )
-                lbright = scipy.vstack(lbright).T
-            
-            # Normalize the VUV signals:
-            for k in xrange(0, xbright.shape[1]):
-                xbright[:, k] = xbright[:, k] / xbright[:, k].max()
-            if self.run_data.loweus_line_idxs:
-                for k in xrange(0, lbright.shape[1]):
-                    lbright[:, k] = lbright[:, k] / lbright[:, k].max()
-            
-            # Group VUV signals for output:
-            if self.run_data.loweus_line_idxs:
-                vbright = scipy.hstack((xbright, lbright))
-            else:
-                vbright = xbright
-            
-            # Compute the XTOMO brightness:
-            xtomobright = {}
-            for s in self.run_data.xtomo_signal_norm_combined.keys():
-                if self.run_data.xtomo_signal_norm_combined[s] is not None:
-                    xtomobright[s] = self.xtomo_weights[s].dot(
-                        dlines[:, -1, :].T
-                    ).T
-                    # Normalize the XTOMO signal:
-                    xtomobright[s] = xtomobright[s] / xtomobright[s].max()
-            
-            # Apply scalings:
-            if self.use_scaling:
-                sbright = sbright * param_scaling[0]
-                for k in xrange(0, len(self.run_data.xeus_line_idxs) + len(self.run_data.loweus_line_idxs)):
-                    vbright[:, k] *= param_scaling[k + 1]
-                i = k + 2
-                for k in self.run_data.xtomo_sig.keys():
-                    if self.run_data.xtomo_sig[k] is not None:
-                        xtomobright[k] *= param_scaling[i]
-                        i += 1
+            sig = []
+            # k is the index of the current block in param_scaling:
+            k = 0
+            for j, s in enumerate(self.signals):
+                out_arr = scipy.zeros_like(s.y)
+                # Use postinj to zero out before the injection:
+                postinj = s.t >= param_source[j]
+                for i in range(0, s.y.shape[1]):
+                    # TODO: This should be moved outside the loop if possible!
+                    if s.weights is not None:
+                        sigl = dlines[:, s.atomdat_idx[i], :].dot(s.weights[i, :])
+                    else:
+                        # TODO: Make sure this does the right thing for local
+                        # signals -- I don't think it will!
+                        sigl = dlines[:, s.atomdat_idx[i], :]
+                    out_arr[postinj, i] = scipy.interpolate.InterpolatedUnivariateSpline(
+                        times[j],
+                        sigl
+                    )(s.t[postinj])
+                # Do the normalization and scaling for each block:
+                for b in scipy.unique(s.blocks):
+                    mask = s.blocks == b
+                    # Normalization:
+                    if self.normalize:
+                        out_arr[:, mask] = out_arr[:, mask] / out_arr[:, mask].max()
+                    # Scaling:
+                    if self.use_scaling:
+                        out_arr[:, mask] *= param_scaling[k]
+                    k += 1
+                
+                sig.append(out_arr)
         else:
-            sbright = self.ar_weights.dot(dlines[:, 0, :].T).T
+            # Just compute the endpoint:
+            sig = self.ar_signal.weights.dot(dlines[-1, 0, :])
+            
             # Normalize the HiReX-SR signal:
-            sbright = sbright / sbright.max()
+            if self.normalize:
+                sig = sig / sig.max()
         
         # Big plots:
-        if debug_plots or big_f is not None:
-            # HiReX-SR and VUV plots:
-            if big_f is None:
-                if steady_ar is None:
-                    big_f, a_H, a_V = self.run_data.plot_data()
-                else:
-                    # Make the figure to hold the time-series data:
-                    big_f = plt.figure()
-                    ncol = 6
-                    nrow = int(scipy.ceil(1.0 * self.run_data.ar_signal.shape[1] / ncol))
-                    gs = mplgs.GridSpec(nrow, ncol)
-                    a_H = []
-                    i_col = 0
-                    i_row = 0
-                    for k in xrange(0, self.run_data.ar_signal.shape[1]):
-                        a_H.append(big_f.add_subplot(gs[i_row, i_col]))
-                        i_col += 1
-                        if i_col >= ncol:
-                            i_col = 0
-                            i_row += 1
-                    
-                    for k in xrange(0, len(a_H)):
-                        a_H[k].set_xlabel('$t$ [s]')
-                        a_H[k].set_ylabel('$b$ [AU]')
-                        a_H[k].set_title('HiReX-SR chord %d' % (k,))
-                        # a_H[k].set_ylim(bottom=0)
-            for a, k in zip(a_H, range(0, len(a_H))):
-                l = a.plot(time_s, sbright[:, k], color=lc, alpha=alpha)
+        if debug_plots:
             if steady_ar is None:
-                for a, k in zip(a_V, range(0, len(a_V))):
-                    l = a.plot(time_v, vbright[:, k], label=label, color=lc, alpha=alpha)
-            big_f.canvas.draw()
-            
-            # XTOMO plots:
-            if steady_ar is None:
-                # Create the figure if necessary:
-                if f_xtomo is None:
-                    f_xtomo = {}
-                    a_xtomo = {}
-                    for k in self.run_data.xtomo_sig.keys():
-                        if self.run_data.xtomo_sig[k] is not None:
-                            f_xtomo[k], a_xtomo[k] = self.run_data.plot_xtomo(k, norm=True)
-                for k, f in f_xtomo.iteritems():
-                    for i in range(0, len(a_xtomo[k])):
-                        a_xtomo[k][i].plot(time_xtomo, xtomobright[k][:, i], label=label, color=lc, alpha=alpha)
+                for i, s in enumerate(self.signals):
+                    f, a = s.plot_data(norm=self.normalize)
+                    srt = s.t.argsort()
+                    for k, ax in enumerate(a):
+                        ax.plot(s.t[srt], sig[i][srt, k])
+            else:
+                # This is just a function of chord number. The time-variation
+                # won't tell me much, but the profile will.
+                f = plt.figure()
+                a = f.add_subplot(1, 1, 1)
+                x = range(0, len(sig))
+                y = self.ar_signal.y_norm if self.normalize else self.ar_signal.y
+                err_y = self.ar_signal.std_y_norm if self.normalize else self.ar_signal.std_y
+                a.boxplot(y, positions=x)
+                a.plot(x, sig, 'go')
         
-        return sbright, vbright, xtomobright
+        return sig
     
-    def sig2diffs(self, params, sbright, vbright, xtomobright, time, steady_ar=None, no_diff=False):
+    def sig2diffs(self, params, sig, time, steady_ar=None):
         """Computes the individual diagnostic differences corresponding to the given signals.
         
         Parameters
         ----------
         params : array of float
             The parameters to use.
-        sbright : array of float, (`n_time`, `n_chords`)
-            The predicted HiReX-SR signals on the STRAHL timebase.
-        vbright : array of float, (`n_time`, `n_lines`)
-            The predicted VUV spectrometer signals (with XEUS first, LoWEUS
-            second) on the STRAHL timebase.
-        xtomobright : dict of arrays of float (`n_time`, `n_chords`)
-            The predicted XTOMO signals on the STRAHL timebase. The keys of the
-            dict should be the system indices as ints, the values should be
-            arrays of float with shape (`n_time`, `n_chords`).
+        sig : list of arrays of float
+            The diagnostic signals. There should be one entry for each element
+            of :py:attr:`self.signals`. Each entry should be an array
+            of float with shape (`n_time`, `n_chords`).
         time : array of float, (`n_time`,)
             The time grid which `dlines` is given on.
         steady_ar : float, optional
             If None, compute for calcium. If a float, compute for argon.
-        no_diff : bool, optional
-            If True, the difference with the experimental data is not taken --
-            just the signals interpolated onto the diagnostic timebase are
-            returned. Default is False (return differences).
         """
         eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.split_params(params)
         
@@ -1576,84 +1506,30 @@ class Run(object):
         time_v = time + param_source[1]
         time_xtomo = time + param_source[2]
         
-        # Interpolate sbright onto the HiReX-SR timebase:
-        sbright_interp = scipy.zeros(
-            (len(self.run_data.hirex_time_combined), sbright.shape[1])
-        )
-        # Use postinj to zero out before the injection:
-        postinj = self.run_data.hirex_time_combined >= param_source[0]
-        for k in xrange(0, sbright.shape[1]):
-            sbright_interp[postinj, k] = scipy.interpolate.InterpolatedUnivariateSpline(
-                time_s,
-                sbright[:, k]
-            )(self.run_data.hirex_time_combined[postinj])
-        
-        if steady_ar is None:
-            # Interpolate vbright onto the VUV timebase(s):
-            vbright_interp = scipy.zeros(
-                (self.run_data.vuv_times_combined.shape[1], vbright.shape[1])
-            )
-            for k in xrange(0, vbright.shape[1]):
-                postinj = self.run_data.vuv_times_combined[k, :] >= param_source[1]
-                vbright_interp[postinj, k] = scipy.interpolate.InterpolatedUnivariateSpline(
-                    time_v,
-                    vbright[:, k]
-                )(self.run_data.vuv_times_combined[k, postinj])
-            
-            # Interpolate xtomobright onto the XTOMO timebase(s):
-            xtomobright_interp = {}
-            for s, b in xtomobright.iteritems():
-                xtomobright_interp[s] = scipy.zeros(
-                    (len(self.run_data.xtomo_times_combined[s]), b.shape[1])
-                )
-                for k in xrange(0, b.shape[1]):
-                    # NOTE: I am using a linear spline to speed this up, since
-                    # there are so many points.
-                    postinj = self.run_data.xtomo_times_combined[s] >= param_source[2]
-                    xtomobright_interp[s][postinj, k] = scipy.interpolate.InterpolatedUnivariateSpline(
-                        time_xtomo,
-                        b[:, k],
-                        k=1
-                    )(self.run_data.xtomo_times_combined[s][postinj])
-        
         # Convert to differences:
         # Weighting must be accomplished in diffs2ln_prob.
         if steady_ar is None:
-            if no_diff:
-                return sbright_interp, vbright_interp, xtomobright_interp
-            else:
-                sbright_diff = sbright_interp - self.run_data.hirex_signal_norm_combined
-                vbright_diff = vbright_interp - self.run_data.vuv_signals_norm_combined.T
-                xtomobright_diff = {}
-                for s, b in xtomobright_interp.iteritems():
-                    xtomobright_diff[s] = b - self.run_data.xtomo_signal_norm_combined[s].T
-                return sbright_diff, vbright_diff, xtomobright_diff
+            sig_diff = []
+            for s, ss in zip(sig, self.signals):
+                sig_diff.append(s - (ss.y_norm if self.normalize else ss.y))
         else:
-            ar_mask = (self.run_data.ar_time >= self.time_1) & (self.run_data.ar_time <= self.time_2)
-            ar_signal = self.run_data.ar_signal[ar_mask, :]
-            ar_sim = scipy.tile(sbright[-1, :], (ar_signal.shape[0], 1))
-            sbright_diff = ar_sim - ar_signal
-            
-            return sbright_diff, None, None
+            sig_diff = sig - (self.ar_signal.y_norm if self.normalize else self.ar_signal.y)
+        
+        return sig_diff
     
     def diffs2ln_prob(
             self,
             params,
-            sbright_diff,
-            vbright_diff,
-            xtomobright_diff,
+            sig_diff,
             steady_ar=None,
-            s_weight=1.0,
-            v_weight=1.0,
-            xtomo_weight=1.0,
-            xtomo_rel_uncertainty=0.1,
+            d_weights=[1.0, 1.0, 1.0],
             sign=1.0
         ):
         r"""Computes the log-posterior corresponding to the given differences.
         
         If there is a NaN in the differences, returns `-scipy.inf`.
         
-        Here, the weighted differences :math:`\chi^2` are taken as
+        Here, the weighted differences :math:`\chi^2` are given as
         
         .. math::
             
@@ -1678,80 +1554,39 @@ class Run(object):
         ----------
         params : array of float
             The parameters to use.
-        sbright_diff : array of float, (`n_time`, `n_chords`)
-            The HiReX-SR differences on the HiReX-SR timebase.
-        vbright_diff : array of float, (`n_time`, `n_lines`)
-            The VUV differences on the VUV timebase, with XEUS first and LoWEUS
-            second.
-        xtomobright_diff : dict of arrays of float (`n_time`, `n_chords`)
-            The XTOMO differences on the XTOMO timebase. The keys of the dict
-            should be the system indices as ints, the values should be arrays of
-            float with shape (`n_time`, `n_chords`).
+        sig_diff : list of arrays of float
+            The diagnostic signal differences. There should be one entry for
+            each element of :py:attr:`self.signals`. Each entry should
+            be an array of float with shape (`n_time`, `n_chords`).
         steady_ar : float, optional
             If None, compute for calcium. If a float, compute for argon.
-        s_weight : float or array of float, (`n_chords`,), optional
-            The factor to weight the HiReX-SR data by. The default is to use 1.0
-            (all chords have the same weight). If this is an array, it applies
-            chord-to-chord.
-        v_weight : float or array of float, (`n_lines`,), optional
-            The factor to weight the VUV data by. The default is to use 1.0 (all
-            lines have the same weight). If this is an array, it applies
-            line-to-line.
-        xtomo_weight : float or dict of float or dict of arrays of float, (`n_chords`,), optional
-            The factor to weight the XTOMO data by. The default is to use 1.0
-            (all systems and chords have the same weight). If this is a dict,
-            the keys should be the XTOMO channel numbers as ints. The values
-            can either be scalar floats (a weight to apply to all chords in the
-            system) or arrays of floats (weights to apply chord-to-chord).
-        xtomo_rel_uncertainty : float, optional
-            The relative uncertainty to use with the XTOMO systems. This is
-            technically somewhat redundant with `xtomo_weight`, but is provided
-            separately for convenience.
+        d_weights : list of float, (`n_sig`,), or list of arrays of float
+            The weights to use for each signal in :py:attr:`self.signals`.
+            Each entry in the outer list applies to the corresponding entry in
+            :py:attr:`self.signals`. Each entry can either be a single,
+            global value to use for the diagnostic, or a list of values for each
+            chord.
         sign : float, optional
             Sign (or other factor) applied to the final result. Set this to -1.0
             to use this function with a minimizer, for instance. Default is 1.0
             (return actual log-posterior).
         """
-        # TODO: Put NaN detection back. This doesn't work because NaN's are used
-        # as placeholders in the HiReX-SR signal.
-        # if (
-        #     scipy.isnan(sbright_diff).any() or (
-        #         (steady_ar is None) and (
-        #             scipy.isnan(vbright_diff).any() or
-        #             scipy.any([scipy.isnan(v).any() for v in xtomobright_diff.values()])
-        #         )
-        #     )
-        # ):
-        #     print("NaN in normalized brightness!")
-        #     return -scipy.inf
-        
         if steady_ar is None:
-            s2 = (s_weight * sbright_diff / self.run_data.hirex_uncertainty_norm_combined)**2.0
-            v2 = (v_weight * vbright_diff / self.run_data.vuv_uncertainties_norm_combined.T)**2.0
-            xtomo2 = {}
-            for s, b in xtomobright_diff.iteritems():
-                xtomo2[s] = (
-                    xtomo_weight * xtomobright_diff[s] / (
-                        xtomo_rel_uncertainty *
-                        self.run_data.xtomo_signal_norm_combined[s].T
-                    )
-                )**2.0
-                # Remove bad channels:
-                xtomo2[s] = xtomo2[s][:, self.run_data.xtomo_channel_mask[s]]
-            chi2 = (
-                s2[~self.run_data.hirex_flagged_combined].sum() +
-                v2.sum() +
-                scipy.sum([b.sum() for b in xtomo2.values()])
-            )
+            chi2 = 0.0
+            for w, s, ss in zip(d_weights, sig_diff, self.signals):
+                dnorm2 = (w * s / (ss.std_y_norm if self.normalize else ss.std_y))**2.0
+                chi2 += dnorm2[~scipy.isnan(dnorm2)].sum()
         else:
-            ar_mask = (self.run_data.ar_time >= self.time_1) & (self.run_data.ar_time <= self.time_2)
-            ar_flagged = self.run_data.ar_flagged[ar_mask, :]
-            s = (s_weight * sbright_diff / self.run_data.ar_uncertainty[ar_mask, :])**2.0
-            chi2 = s.ravel()[~ar_flagged.ravel()]
+            dnorm2 = (sig_diff / (self.ar_signal.std_y_norm if self.normalize else self.ar_signal.std_y))**2.0
+            chi2 = dnorm2[~scipy.isnan(dnorm2)].sum()
         
-        lp = sign * (-0.5 * chi2 + self.get_prior()(params))
-        # print(lp)
-        return lp
+        # This indicates that the brightness differences were all NaN:
+        if chi2 == 0.0:
+            return -sign * scipy.inf
+        else:
+            lp = sign * (-0.5 * chi2 + self.get_prior()(params))
+            # print(lp)
+            return lp
     
     
     # The following are all wrapper functions. I explicitly copied the arguments
@@ -1887,15 +1722,14 @@ class Run(object):
             ar_a=None,
             label='_nolegend_',
             lc='g',
-            alpha=1.0,
-            no_diff=False
+            alpha=1.0
         ):
         """Computes the diagnostic differences corresponding to the given local emissivities.
         
         This is simply a wrapper around the chain of :py:meth:`dlines2sig` ->
         :py:meth:`sig2diffs`. See those functions for argument descriptions.
         """
-        sbright, vbright, xtomobright = self.dlines2sig(
+        sig = self.dlines2sig(
             params,
             dlines,
             time,
@@ -1914,26 +1748,18 @@ class Run(object):
         )
         return self.sig2diffs(
             params,
-            sbright,
-            vbright,
-            xtomobright,
+            sig,
             time,
-            steady_ar=steady_ar,
-            no_diff=no_diff
+            steady_ar=steady_ar
         )
     
     def sig2ln_prob(
             self,
             params,
-            sbright,
-            vbright,
-            xtomobright,
+            sig,
             time,
             steady_ar=None,
-            s_weight=1.0,
-            v_weight=1.0,
-            xtomo_weight=1.0,
-            xtomo_rel_uncertainty=0.1,
+            d_weights=[1.0, 1.0, 1.0],
             sign=1.0
         ):
         """Computes the log-posterior corresponding to the given diagnostic signals.
@@ -1941,27 +1767,20 @@ class Run(object):
         This is simply a wrapper around the chain of :py:meth:`sig2diffs` ->
         :py:meth:`diffs2ln_prob`. See those functions for argument descriptions.
         """
-        sbright_diff, vbright_diff, xtomobright_diff = self.sig2diffs(
+        sig_diff = self.sig2diffs(
             params,
-            sbright,
-            vbright,
-            xtomobright,
+            sig,
             time,
             steady_ar=steady_ar
         )
         return self.diffs2ln_prob(
             params,
-            sbright_diff,
-            vbright_diff,
-            xtomobright_diff,
+            sig_diff,
             steady_ar=steady_ar,
-            s_weight=s_weight,
-            v_weight=v_weight,
-            xtomo_weight=xtomo_weight,
-            xtomo_rel_uncertainty=xtomo_rel_uncertainty,
+            d_weights=d_weights,
             sign=sign
         )
-        
+    
     def DV2sig(
             self,
             params,
@@ -2037,7 +1856,6 @@ class Run(object):
             lc=lc,
             alpha=alpha
         )
-        
     
     def cs_den2diffs(
             self,
@@ -2058,8 +1876,7 @@ class Run(object):
             ar_a=None,
             label='_nolegend_',
             lc='g',
-            alpha=1.0,
-            no_diff=False
+            alpha=1.0
         ):
         """Computes the diagnostic differences corresponding to the given charge state densities.
         
@@ -2077,7 +1894,7 @@ class Run(object):
             steady_ar=steady_ar,
             debug_plots=debug_plots
         )
-        sbright, vbright, xtomobright = self.dlines2sig(
+        sig = self.dlines2sig(
             params,
             dlines,
             time,
@@ -2096,12 +1913,9 @@ class Run(object):
         )
         return self.sig2diffs(
             params,
-            sbright,
-            vbright,
-            xtomobright,
+            sig,
             time,
-            steady_ar=steady_ar,
-            no_diff=no_diff
+            steady_ar=steady_ar
         )
     
     def dlines2ln_prob(
@@ -2121,10 +1935,7 @@ class Run(object):
             label='_nolegend_',
             lc='g',
             alpha=1.0,
-            s_weight=1.0,
-            v_weight=1.0,
-            xtomo_weight=1.0,
-            xtomo_rel_uncertainty=0.1,
+            d_weights=[1.0, 1.0, 1.0],
             sign=1.0
         ):
         """Computes the log-posterior corresponding to the given local emissivities.
@@ -2133,7 +1944,7 @@ class Run(object):
         :py:meth:`sig2diffs` -> :py:meth:`diffs2ln_prob`. See those functions
         for argument descriptions.
         """
-        sbright, vbright, xtomobright = self.dlines2sig(
+        sig = self.dlines2sig(
             params,
             dlines,
             time,
@@ -2150,24 +1961,17 @@ class Run(object):
             lc=lc,
             alpha=alpha
         )
-        sbright_diff, vbright_diff, xtomobright_diff = self.sig2diffs(
+        sig_diff = self.sig2diffs(
             params,
-            sbright,
-            vbright,
-            xtomobright,
+            sig,
             time,
             steady_ar=steady_ar
         )
         return self.diffs2ln_prob(
             params,
-            sbright_diff,
-            vbright_diff,
-            xtomobright_diff,
+            sig_diff,
             steady_ar=steady_ar,
-            s_weight=s_weight,
-            v_weight=v_weight,
-            xtomo_weight=xtomo_weight,
-            xtomo_rel_uncertainty=xtomo_rel_uncertainty,
+            d_weights=d_weights,
             sign=sign
         )
     
@@ -2192,8 +1996,7 @@ class Run(object):
             ar_a=None,
             label='_nolegend_',
             lc='g',
-            alpha=1.0,
-            no_diff=False
+            alpha=1.0
         ):
         """Computes the diagnostic differences corresponding to the given parameters.
         
@@ -2230,7 +2033,7 @@ class Run(object):
             steady_ar=steady_ar,
             debug_plots=debug_plots
         )
-        sbright, vbright, xtomobright = self.dlines2sig(
+        sig = self.dlines2sig(
             params,
             dlines,
             time,
@@ -2249,12 +2052,9 @@ class Run(object):
         )
         return self.sig2diffs(
             params,
-            sbright,
-            vbright,
-            xtomobright,
+            sig,
             time,
-            steady_ar=steady_ar,
-            no_diff=no_diff
+            steady_ar=steady_ar
         )
     
     def cs_den2ln_prob(
@@ -2277,10 +2077,7 @@ class Run(object):
             label='_nolegend_',
             lc='g',
             alpha=1.0,
-            s_weight=1.0,
-            v_weight=1.0,
-            xtomo_weight=1.0,
-            xtomo_rel_uncertainty=0.1,
+            d_weights=[1.0, 1.0, 1.0],
             sign=1.0
         ):
         """Computes the log-posterior corresponding to the given charge-state densities.
@@ -2299,7 +2096,7 @@ class Run(object):
             steady_ar=steady_ar,
             debug_plots=debug_plots
         )
-        sbright, vbright, xtomobright = self.dlines2sig(
+        sig = self.dlines2sig(
             params,
             dlines,
             time,
@@ -2316,27 +2113,116 @@ class Run(object):
             lc=lc,
             alpha=alpha
         )
-        sbright_diff, vbright_diff, xtomobright_diff = self.sig2diffs(
+        sig_diff = self.sig2diffs(
             params,
-            sbright,
-            vbright,
-            xtomobright,
+            sig,
             time,
             steady_ar=steady_ar
         )
         return self.diffs2ln_prob(
             params,
-            sbright_diff,
-            vbright_diff,
-            xtomobright_diff,
+            sig_diff,
             steady_ar=steady_ar,
-            s_weight=s_weight,
-            v_weight=v_weight,
-            xtomo_weight=xtomo_weight,
-            xtomo_rel_uncertainty=xtomo_rel_uncertainty,
+            d_weights=d_weights,
             sign=sign
         )
     
+    # Special handling for local measurements:
+    def cs_den2local_diffs(self, params, cs_den, sqrtpsinorm, time, cs_mask=None):
+        """Computes the differences in local charge state densities corresponding to the given local charge state densities.
+        
+        Interpolates the local charge state densities from STRAHL onto the same
+        grid as :py:attr:`self.run_data.cs_den` and finds the difference. This
+        is only done for the charge states specified in `cs_mask` to save time.
+        
+        Parameters
+        ----------
+        params : array of float
+            The parameters to use.
+        cs_den : array of float, (`n_time`, `n_cs`, `n_space`)
+            The charge state densities as computed by STRAHL.
+        sqrtpsinorm : array of float, (`n_space`,)
+            The square root of psinorm grid which `cs_den` is given on.
+        time : array of float, (`n_time`,)
+            The time grid which `cs_den` is given on.
+        cs_mask : array of bool, (`n_cs`,), optional
+            The charge states to use in the inference. These are given in
+            ascending order, such that the (zero-based) index is the charge of
+            the ion. The default is to use all charge states (including the
+            neutrals).
+        
+        Returns
+        -------
+        local_diffs : array of float, (`n_time`, `n_cs_masked`, `n_space`)
+            The difference between the predicted and observed local charge state
+            densities, as a function of time and space.
+        """
+        # TODO: Needs a flag to turn normalization on/off!
+        if cs_mask is None:
+            cs_mask = scipy.ones(cs_den.shape[1], dtype=bool)
+        
+        # Throw out the charge states which are not to be included in the inference:
+        cs_den = cs_den[:, cs_mask, :]
+        local_diffs = scipy.zeros_like(self.run_data.cs_den[:, cs_mask, :])
+        
+        # Loop over the charge states which are to be included in the inference and
+        # interpolate them onto the time and space grid used in run_data:
+        for i in range(0, cs_den.shape[1]):
+            local_diffs[:, i, :] = scipy.interpolate.RectBivariateSpline(
+                time, sqrtpsinorm, cs_den[:, i, :], s=0
+            )(run_data.cs_time, run_data.cs_sqrtpsinorm) - run_data.cs_den[:, cs_mask, :]
+        
+        return local_diffs
+    
+    def local_diffs2ln_prob(self, params, local_diffs, cs_mask=None, sign=1.0):
+        r"""Computes the log-posterior corresponding to the given local charge state density differences.
+        
+        Here, the weighted differences :math:`\chi^2` are given as
+        
+        .. math::
+            
+            \chi^2 = \sum_i \left ( \frac{b_{STRAHL, i} - b_{data, i}}{\sigma_i} \right )^2
+        
+        The log-posterior itself is then computed as
+        
+        .. math::
+            
+            \ln p \propto -\chi^2 / 2 + \ln p(D, V)
+        
+        Here, :math:`\ln p(D, V)` is the log-prior.
+        
+        Parameters
+        ----------
+        params : array of float
+            The parameters to use.
+        local_diffs : array of float, (`n_time`, `n_cs_masked`, `n_space`)
+            The difference between the predicted and observed local charge state
+            densities, as a function of time and space.
+        cs_mask : array of bool, (`n_cs`,), optional
+            The charge states to use in the inference. These are given in
+            ascending order, such that the (zero-based) index is the charge of
+            the ion. The default is to use all charge states (including the
+            neutrals). THIS MUST BE THE SAME AS WAS USED WHEN CALLING
+            :py:meth:`cs_den2local_diffs` OR IT WILL NOT WORK RIGHT!
+        sign : float, optional
+            Sign (or other factor) applied to the final result. Set this to -1.0
+            to use this function with a minimizer, for instance. Default is 1.0
+            (return actual log-posterior).
+        
+        Returns
+        -------
+        lp : float
+            The log-posterior.
+        """
+        if cs_mask is None:
+            cs_mask = scipy.ones(local_diffs.shape[1])
+        
+        # TODO: Put flags to turn noise/normalization on/off!
+        chi2 = ((local_diffs / self.run_data.cs_den_uncertainty[:, cs_mask, :])**2.0).sum()
+        lp = sign * (-0.5 * chi2 + self.get_prior()(params))
+        return lp
+    
+    # End-to-end routines:
     def DV2ln_prob(
             self,
             params,
@@ -2360,10 +2246,9 @@ class Run(object):
             label='_nolegend_',
             lc='g',
             alpha=1.0,
-            s_weight=1.0,
-            v_weight=1.0,
-            xtomo_weight=1.0,
-            xtomo_rel_uncertainty=0.1
+            d_weights=[1.0, 1.0, 1.0],
+            use_local=False,
+            cs_mask=None
         ):
         """Computes the log-posterior corresponding to the given parameters.
         
@@ -2373,7 +2258,11 @@ class Run(object):
         for argument descriptions. This is designed to work as a log-posterior
         function for various MCMC samplers, etc.
         
-        THOUGH I MAY WANT TO CONSIDER A STREAMLINED VERSION!!!
+        Parameters
+        ----------
+        use_local : bool, optional
+            If True, local measurements are used instead of line-integrated
+            measurements. Default is False (use line-integrated measurements).
         """
         out = self.DV2cs_den(
             params,
@@ -2394,59 +2283,66 @@ class Run(object):
                 "Something went wrong with STRAHL, return value of DV2cs_den is: '"
                 + str(out) + "', params are: " + str(params)
             )
-        dlines = self.cs_den2dlines(
-            params,
-            cs_den,
-            sqrtpsinorm,
-            time,
-            ne,
-            Te,
-            steady_ar=steady_ar,
-            debug_plots=debug_plots
-        )
-        sbright, vbright, xtomobright = self.dlines2sig(
-            params,
-            dlines,
-            time,
-            steady_ar=steady_ar,
-            debug_plots=debug_plots,
-            big_f=big_f,
-            a_H=a_H,
-            a_V=a_V,
-            f_xtomo=f_xtomo,
-            a_xtomo=a_xtomo,
-            ar_f=ar_f,
-            ar_a=ar_a,
-            label=label,
-            lc=lc,
-            alpha=alpha
-        )
-        sbright_diff, vbright_diff, xtomobright_diff = self.sig2diffs(
-            params,
-            sbright,
-            vbright,
-            xtomobright,
-            time,
-            steady_ar=steady_ar
-        )
-        return self.diffs2ln_prob(
-            params,
-            sbright_diff,
-            vbright_diff,
-            xtomobright_diff,
-            steady_ar=steady_ar,
-            s_weight=s_weight,
-            v_weight=v_weight,
-            xtomo_weight=xtomo_weight,
-            xtomo_rel_uncertainty=xtomo_rel_uncertainty,
-            sign=sign
-        )
+        if use_local:
+            local_diffs = self.cs_den2local_diffs(params, cs_den, sqrtpsinorm, time, cs_mask=cs_mask)
+            return self.local_diffs2ln_prob(params, local_diffs, cs_mask=cs_mask, sign=sign)
+        else:
+            dlines = self.cs_den2dlines(
+                params,
+                cs_den,
+                sqrtpsinorm,
+                time,
+                ne,
+                Te,
+                steady_ar=steady_ar,
+                debug_plots=debug_plots
+            )
+            sig = self.dlines2sig(
+                params,
+                dlines,
+                time,
+                steady_ar=steady_ar,
+                debug_plots=debug_plots,
+                big_f=big_f,
+                a_H=a_H,
+                a_V=a_V,
+                f_xtomo=f_xtomo,
+                a_xtomo=a_xtomo,
+                ar_f=ar_f,
+                ar_a=ar_a,
+                label=label,
+                lc=lc,
+                alpha=alpha
+            )
+            sig_diff = self.sig2diffs(
+                params,
+                sig,
+                time,
+                steady_ar=steady_ar
+            )
+            return self.diffs2ln_prob(
+                params,
+                sig_diff,
+                steady_ar=steady_ar,
+                d_weights=d_weights,
+                sign=sign
+            )
     
-    def u2ln_prob(self, u, nl_grad=None, sign=1.0, return_grad=False, grad_only=False, pool=None, eps=scipy.sqrt(sys.float_info.epsilon), **kwargs):
+    def u2ln_prob(
+            self,
+            u,
+            nl_grad=None,
+            sign=1.0,
+            return_grad=False,
+            grad_only=False,
+            pool=None,
+            eps=scipy.sqrt(sys.float_info.epsilon),
+            **kwargs
+        ):
         r"""Convert the log-posterior corresponding to a given set of CDF values.
         
-        Passes the values `u` (which lie in :math:`[0, 1]`) through the inverse CDF
-        before passing them to :py:meth:`DV2ln_prob`.
+        Passes the values `u` (which lie in :math:`[0, 1]`) through the inverse
+        CDF before passing them to :py:meth:`DV2ln_prob`.
         
         Also catches out-of-bounds and exceptions so as to be useful for
         optimization.
@@ -2561,976 +2457,6 @@ class Run(object):
         if return_grad:
             print(time_.time() - start)
         return out
-    
-    # Old version:
-    # def compute_ln_prob(
-    #         self,
-    #         params,
-    #         return_blob=False,
-    #         light_blob=False,
-    #         sign=1,
-    #         no_prior=False,
-    #         compute_view_data=False,
-    #         debug_plots=False,
-    #         compute_NC=False,
-    #         explicit_D=None,
-    #         explicit_D_grid=None,
-    #         explicit_V=None,
-    #         explicit_V_grid=None,
-    #         no_write=False,
-    #         no_strahl=False,
-    #         STRAHL_compute_rad=False,
-    #         label='_nolegend_',
-    #         lc=None,
-    #         big_f=None,
-    #         a_H=None,
-    #         a_V=None,
-    #         ar_f=None,
-    #         ar_a=None,
-    #         steady_ar=None,
-    #         alpha=1.0
-    #     ):
-    #     """Calls STRAHL with the given params and computes the log-posterior.
-    #
-    #     Returns the log-posterior, or optionally the log-likelihood.
-    #
-    #     Parameters
-    #     ----------
-    #     params : array of float, (`num_eig_D` + `num_eig_V` + `num_param_k_D` + `num_param_k_V` + `num_param_source`)
-    #         The parameters to use. The order is:
-    #
-    #         * eig_D: The eigenvalues to use when evaluating the D profile.
-    #         * eig_V: The eigenvalues to use when evaluating the V profile.
-    #         * param_D: The hyperparameters to use for the D profile.
-    #         * param_mu_D: The hyperparameters to use for the mean function of the D profile.
-    #         * param_V: The hyperparameters to use for the V profile.
-    #         * knots_D: The knots of the D profile.
-    #         * knots_V: The knots of the V profile.
-    #         * scaling: The scaling factors for each diagnostic.
-    #         * param_source: The parameters to use for the model source function.
-    #     return_blob : bool, optional
-    #         If True, a blob with metadata from the evaluation will be returned
-    #         along with the log-probability. The entries of the blob are ordered
-    #         as follows:
-    #
-    #         * Log-likelihood
-    #         * Normalized HiReX-SR brightness
-    #         * Normalized VUV brightness
-    #         * Time array for both
-    #         * String with all of the output from STRAHL during the run
-    #
-    #         Default is False
-    #     light_blob : bool, optional
-    #         If True, the blob returned when `returb_blob` is True will contain
-    #         only the log-likelihood (needed to compute various useful things).
-    #         Default is False (return full blob).
-    #     sign : float, optional
-    #         A factor to apply to the output. This allows the user to change the
-    #         sign of the log-probability so that a minimizer can be used to find
-    #         the maximum probability. The default is 1.
-    #     no_prior : bool, optional
-    #         If True, the log-likelihood is returned instead of the log-posterior.
-    #         Default is False.
-    #     compute_view_data : bool, optional
-    #         Set this to True to only compute the view_data.sav file. (Returns
-    #         the sqrtpsinorm grid STRAHL uses.)
-    #     debug_plots : bool, optional
-    #         Set this to True to make a plot of the STRAHL output on top of the
-    #         experimental data. Only has an effect if `compute_view_data` is
-    #         False. Default is False.
-    #     compute_NC : bool, optional
-    #         Set this to True to have STRAHL attempt to compute the neoclassical
-    #         transport. At present these values are not returned, but a plot will
-    #         be produced if `debug_plots` is True. Default is False.
-    #     explicit_D : array of float, optional
-    #         Explicit values of D to use. Overrides the profile which would have
-    #         been obtained from the parameters in `params` (but the scalings/etc.
-    #         from `params` are still used).
-    #     explicit_D_grid : array of float, optional
-    #         Grid of sqrtpsinorm which `explicit_D` is given on.
-    #     explicit_V : array of float, optional
-    #         Explicit values of V to use. Overrides the profile which would have
-    #         been obtained from the parameters in `params` (but the scalings/etc.
-    #         from `params` are still used).
-    #     explicit_V_grid : array of float, optional
-    #         Grid of sqrtpsinorm which `explicit_V` is given on.
-    #     no_write : bool, optional
-    #         If True, the STRAHL control files are not written. Used for
-    #         debugging. Default is False.
-    #     no_strahl : bool, optional
-    #         If True, STRAHL is not actually called (and the existing results
-    #         file is evaluated). Used for debugging. Default is False.
-    #     STRAHL_compute_rad : bool, optional
-    #         If True, STRAHL is used to compute the line radiation. Default is
-    #         False.
-    #     label : str, optional
-    #         Label to use for lines added to existing figures. Default is
-    #         '_nolegend_'.
-    #     lc : str, optional
-    #         Line color to use for lines added to existing figures. Default is
-    #         None.
-    #     big_f : Figure instance, optional
-    #         The figure containing plots of each data source. If not present, a
-    #         new figure is created by calling :py:meth:`RunData.plot_data`.
-    #     a_H : list of Axes instances, optional
-    #         The axes from `big_f` which contain the HiReX-SR data.
-    #     a_V : list of Axes instances, optional
-    #         The axes from `big_f` which contain the VUV spectrometer data.
-    #     ar_f : Figure instance, optional
-    #         The figure containing the argon data. If not present, a new figure
-    #         is created by calling :py:meth:`RunData.plot_ar`.
-    #     ar_a : Axes instance, optional
-    #         The axes from `ar_f` to plot the argon profile on.
-    #     steady_ar : float, optional
-    #         If present, will compute the steady-state (constant-source) Ar
-    #         profiles for the given source instead of the time-evolving Ca
-    #         profiles. Default is None.
-    #     """
-    #     t_start = time_.time()
-    #
-    #     eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.split_params(params)
-    #
-    #     if (explicit_D is None) or (explicit_V is None):
-    #         # First, evaluate the prior:
-    #         lnprob = self.get_prior()(params)
-    #     else:
-    #         # But skip the prior if there is an explicit D or V:
-    #         lnprob = 0.0
-    #
-    #     ll = -scipy.inf
-    #
-    #     # Set default blob if needed:
-    #     if return_blob:
-    #         if light_blob:
-    #             blob = [-scipy.inf]
-    #         else:
-    #             blob = [-scipy.inf, None, None, None, 'Infinite prior!']
-    #
-    #     # Only bother to evaluate if the prior is finite, or force it to run
-    #     # through is we are just computing view data:
-    #     if not scipy.isinf(lnprob) or compute_view_data:
-    #         # Compute and check the profiles:
-    #         if (explicit_D is None) or (explicit_V is None):
-    #             try:
-    #                 D, V = self.eval_DV(params, plot=debug_plots)
-    #             except ValueError:
-    #                 print("Failure evaluating profiles!")
-    #                 if return_blob:
-    #                     if not light_blob:
-    #                         blob[-1] = 'Failed evaluation of D, V!'
-    #                     return (sign * -scipy.inf, blob)
-    #                 else:
-    #                     return sign * -scipy.inf
-    #         # Get the correct grids, handle explicit D and V:
-    #         if explicit_D is not None:
-    #             D = explicit_D
-    #             D_grid = explicit_D_grid
-    #         else:
-    #             D_grid = scipy.sqrt(self.psinorm_grid_DV)
-    #         if explicit_V is not None:
-    #             V = explicit_V
-    #             V_grid = explicit_V_grid
-    #         else:
-    #             V_grid = scipy.sqrt(self.psinorm_grid_DV)
-    #         # Check for bad values in D, V profiles:
-    #         if scipy.isinf(D).any() or scipy.isnan(D).any():
-    #             print("inf in D!")
-    #             print(params)
-    #             if return_blob:
-    #                 if not light_blob:
-    #                     blob[-1] = 'Infinite D!'
-    #                 return (sign * -scipy.inf, blob)
-    #             else:
-    #                 return sign * -scipy.inf
-    #         if scipy.isinf(V).any() or scipy.isnan(V).any():
-    #             print("inf in V!")
-    #             print(params)
-    #             if return_blob:
-    #                 if not light_blob:
-    #                     blob[-1] = 'Infinite V!'
-    #                 return (sign * -scipy.inf, blob)
-    #             else:
-    #                 return sign * -scipy.inf
-    #
-    #         # Evaluate the source function:
-    #         # if self.source_file is None:
-    #         #     t_source = scipy.linspace(
-    #         #         self.time_1,
-    #         #         self.time_1 + param_source[1] + param_source[3],
-    #         #         self.nt_source
-    #         #     )
-    #         #     s = 1e17 * source_function(t_source, self.time_1, *param_source[1:])
-    #
-    #         # Evaluate ne, Te:
-    #         ne = self.run_data.ne_res['mean_val']
-    #         Te = self.run_data.Te_res['mean_val']
-    #         # HACK to get rid of negative values in ne, Te:
-    #         ne[ne < 0.0] = 0.0
-    #         Te[Te < 0.0] = 0.0
-    #
-    #         # Now write the param and pp files, if required:
-    #         if not no_write:
-    #             # Need to override the start/end times of steady_ar is not None:
-    #             if steady_ar is None:
-    #                 time_2_override = None
-    #             else:
-    #                 time_2_override = self.time_1 + 0.2
-    #             self.write_control(time_2_override=time_2_override)
-    #             self.write_pp(
-    #                 scipy.sqrt(self.psinorm_grid),
-    #                 ne,
-    #                 Te,
-    #                 self.time_2 if steady_ar is None else time_2_override
-    #             )
-    #             self.write_param(
-    #                 D_grid,
-    #                 V_grid,
-    #                 D,
-    #                 V,
-    #                 compute_NC=compute_NC,
-    #                 const_source=steady_ar,
-    #                 element='Ca' if steady_ar is None else 'Ar',
-    #                 time_2_override=time_2_override
-    #             )
-    #
-    #         # Now call STRAHL:
-    #         try:
-    #             if no_strahl:
-    #                 out = 'STRAHL not run!'
-    #             else:
-    #                 command = ['./strahl', 'a']
-    #                 # The "n" disables STRAHL's calculation of radiation.
-    #                 if not STRAHL_compute_rad:
-    #                     command += ['n',]
-    #                 out = subprocess.check_output(command, stderr=subprocess.STDOUT)
-    #         except subprocess.CalledProcessError as e:
-    #             print("STRAHL exited with error code %d." % (e.returncode))
-    #             if return_blob:
-    #                 if not light_blob:
-    #                     blob[-1] = str(e.returncode)
-    #                 return (sign * -scipy.inf, blob)
-    #             else:
-    #                 return sign * -scipy.inf
-    #
-    #         if return_blob:
-    #             if not light_blob:
-    #                 blob[-1] = out
-    #
-    #         # Process the results:
-    #         f = scipy.io.netcdf.netcdf_file('result/strahl_result.dat', 'r')
-    #         sqrtpsinorm = scipy.asarray(f.variables['rho_poloidal_grid'][:], dtype=float)
-    #         if compute_view_data:
-    #             return sqrtpsinorm
-    #         time = scipy.asarray(f.variables['time'][:], dtype=float)
-    #
-    #         # Check to make sure it ran through:
-    #         if time[-1] <= self.time_2 - 0.1 * (self.time_2 - self.time_1):
-    #             print(time[-1])
-    #             print(len(time))
-    #             print("STRAHL failed (max iterations)!")
-    #             if return_blob:
-    #                 return (sign * -scipy.inf, blob)
-    #             else:
-    #                 return sign * -scipy.inf
-    #
-    #         # Shift the timebase to be centered on the injection, applying the
-    #         # temporal shifts from the parameters:
-    #         time = time - self.time_1
-    #         time_s = time + param_source[0]
-    #         time_v = time + param_source[1]
-    #
-    #         # dlines has shape (n_time, n_lines, n_space)
-    #         strahl_dlines = scipy.asarray(f.variables['diag_lines_radiation'][:], dtype=float)
-    #
-    #         # cs_den has shape (n_time, n_cs, n_space)
-    #         cs_den = scipy.asarray(f.variables['impurity_density'][:], dtype=float)
-    #
-    #         # Compute my own emissivity:
-    #         ne = scipy.asarray(f.variables['electron_density'][:], dtype=float)
-    #         Te = scipy.asarray(f.variables['electron_temperature'][:], dtype=float)
-    #         dlines = scipy.zeros_like(strahl_dlines)
-    #         atomdat = self.atomdat if steady_ar is None else self.Ar_atomdat
-    #         if steady_ar is None:
-    #             for i, chg, cw, hw in zip(
-    #                     range(0, len(atomdat[0])),
-    #                     atomdat[0],
-    #                     atomdat[1],
-    #                     atomdat[2]
-    #                 ):
-    #                 dlines[:, i, :] = compute_emiss(
-    #                     self.PEC[chg],
-    #                     cw,
-    #                     hw,
-    #                     ne,
-    #                     cs_den[:, chg, :],
-    #                     Te
-    #                 )
-    #         else:
-    #             # We need to add up the contributions to the z-line. These are
-    #             # stored in the PEC dict in the charge of the state the line is
-    #             # populated from.
-    #             # Excitation:
-    #             dlines[:, 0, :] = compute_emiss(
-    #                 self.Ar_PEC[16],
-    #                 4.0,
-    #                 0.1,
-    #                 ne,
-    #                 cs_den[:, 16, :],
-    #                 Te,
-    #                 no_ne=True
-    #             )
-    #             # Ionization:
-    #             dlines[:, 0, :] += compute_emiss(
-    #                 self.Ar_PEC[15],
-    #                 4.0,
-    #                 0.1,
-    #                 ne,
-    #                 cs_den[:, 15, :],
-    #                 Te,
-    #                 no_ne=True
-    #             )
-    #             # Recombination:
-    #             dlines[:, 0, :] += compute_emiss(
-    #                 self.Ar_PEC[17],
-    #                 4.0,
-    #                 0.1,
-    #                 ne,
-    #                 cs_den[:, 17, :],
-    #                 Te,
-    #                 no_ne=True
-    #             )
-    #
-    #         if debug_plots:
-    #             # Plot the charge state densities:
-    #             slider_plot(
-    #                 sqrtpsinorm,
-    #                 time,
-    #                 scipy.rollaxis(cs_den.T, 1),
-    #                 xlabel=r'$\sqrt{\psi_n}$',
-    #                 ylabel=r'$t$ [s]',
-    #                 zlabel=r'$n$ [cm$^{-3}$]',
-    #                 labels=[str(i) for i in range(0, cs_den.shape[1])]
-    #             )
-    #             # Plot the emissivity profiles:
-    #             slider_plot(
-    #                 sqrtpsinorm,
-    #                 time,
-    #                 scipy.rollaxis(dlines.T, 1),
-    #                 xlabel=r'$\sqrt{\psi_n}$',
-    #                 ylabel=r'$t$ [s]',
-    #                 zlabel=r'$\epsilon$ [W/cm$^3$]',
-    #                 labels=[str(i) for i in range(0, dlines.shape[1])]
-    #             )
-    #             # Plot the emissivity I compute versus what STRAHL computes:
-    #             if STRAHL_compute_rad:
-    #                 slider_plot(
-    #                     sqrtpsinorm,
-    #                     time,
-    #                     scipy.vstack(
-    #                         (
-    #                             scipy.rollaxis(dlines.T, 1),
-    #                             scipy.rollaxis(strahl_dlines.T, 1)
-    #                         ),
-    #                     ),
-    #                     xlabel=r'$\sqrt{\psi_n}$',
-    #                     ylabel=r'$t$ [s]',
-    #                     zlabel=r'$\epsilon$ [W/cm$^3$]',
-    #                     labels=['bayesimp ' + str(i) for i in range(0, dlines.shape[1])] +
-    #                            ['STRAHL ' + str(i) for i in range(0, dlines.shape[1])]
-    #                 )
-    #
-    #             if compute_NC:
-    #                 roa = self.efit_tree.psinorm2roa(
-    #                     sqrtpsinorm**2,
-    #                     (self.time_1 + self.time_2) / 2.0
-    #                 )
-    #                 D_neo = (
-    #                     f.variables['classical_diff_coeff'][:] +
-    #                     f.variables['pfirsch_schlueter_diff_coeff'][:] +
-    #                     f.variables['banana_plateau_diff_coeff'][:]
-    #                 )[-1, :] * 1e-4
-    #                 V_neo = (
-    #                     f.variables['classical_drift'][:] +
-    #                     f.variables['pfirsch_schlueter_drift'][:] +
-    #                     f.variables['banana_plateau_drift'][:]
-    #                 )[-1, :] * 1e-2
-    #                 fig = plt.figure()
-    #                 a_D = fig.add_subplot(2, 1, 1)
-    #                 a_D.plot(roa, D_neo)
-    #                 a_V = fig.add_subplot(2, 1, 2)
-    #                 a_V.plot(roa, V_neo)
-    #                 a_D.set_xlabel('$r/a$')
-    #                 a_D.set_ylabel('$D$ [m$^2$/s]')
-    #                 a_V.set_xlabel('$r/a$')
-    #                 a_V.set_ylabel('$V$ [m/s]')
-    #
-    #         # Compute the brightnesses:
-    #         # These set the mapping from the indices in the STRAHL output to the
-    #         # instruments:
-    #         # TODO: THIS SHOULD JUST GET STORED IN RUN_DATA!
-    #         hirex_line = 0
-    #         xeus_lines = range(1, 1 + len(self.run_data.vuv_lines['XEUS']))
-    #         # TODO: Make this robust to leaving out one or more instruments!
-    #         if 'LoWEUS' in self.run_data.vuv_lines:
-    #             loweus_lines = range(
-    #                 1 + len(self.run_data.vuv_lines['XEUS']),
-    #                 1 + len(self.run_data.vuv_lines['XEUS']) +
-    #                     len(self.run_data.vuv_lines['LoWEUS'])
-    #             )
-    #         else:
-    #             loweus_lines = None
-    #
-    #         # Compute the HiReX-SR brightness:
-    #         if steady_ar is None:
-    #             # Compute the HiReX-SR brightness:
-    #             sbright = self.weights[:self.run_data.hirex_pos.shape[0]].dot(dlines[:, hirex_line, :].T).T
-    #             # Compute the XEUS brightness:
-    #             xbright = []
-    #             for i in xeus_lines:
-    #                 xbright.append(self.weights[self.run_data.hirex_pos.shape[0]].dot(dlines[:, i, :].T))
-    #             xbright = scipy.vstack(xbright).T
-    #             # Compute the LoWEUS brightness:
-    #             if loweus_lines is not None:
-    #                 lbright = []
-    #                 for i in loweus_lines:
-    #                     lbright.append(self.weights[self.run_data.hirex_pos.shape[0] + 1].dot(dlines[:, i, :].T))
-    #                 lbright = scipy.vstack(lbright).T
-    #             # Normalize the VUV signals:
-    #             for k in xrange(0, xbright.shape[1]):
-    #                 xbright[:, k] = xbright[:, k] / xbright[:, k].max()
-    #             if loweus_lines is not None:
-    #                 for k in xrange(0, lbright.shape[1]):
-    #                     lbright[:, k] = lbright[:, k] / lbright[:, k].max()
-    #
-    #             if loweus_lines is not None:
-    #                 vbright = scipy.hstack((xbright, lbright))
-    #             else:
-    #                 vbright = xbright
-    #
-    #             # Apply scalings:
-    #             if self.use_scaling:
-    #                 sbright = sbright * param_scaling[0]
-    #                 for k in xrange(0, len(param_scaling) - 1):
-    #                     vbright[:, k] *= param_scaling[k + 1]
-    #         else:
-    #             sbright = self.ar_weights.dot(dlines[:, 0, :].T).T
-    #
-    #         # Normalize the HiReX-SR signal:
-    #         sbright = sbright / sbright.max()
-    #
-    #         # Do this after in case there was a divide-by-zero (or just bad
-    #         # STRAHL output):
-    #         if scipy.isnan(sbright).any() or ((steady_ar is None) and (scipy.isnan(vbright).any())):
-    #             print("NaN in normalized brightness!")
-    #             if return_blob:
-    #                 return (sign * -scipy.inf, blob)
-    #             else:
-    #                 return sign * -scipy.inf
-    #
-    #         # Compute chi^2, add it to lnprob (the log-prior):
-    #         # Interpolate sbright onto the HiReX-SR timebase:
-    #         sbright_interp = scipy.zeros((len(self.run_data.hirex_time_combined), sbright.shape[1]))
-    #         # Use postinj to zero out before the injection:
-    #         postinj = self.run_data.hirex_time_combined >= param_source[0]
-    #         for k in xrange(0, sbright.shape[1]):
-    #             sbright_interp[postinj, k] = scipy.interpolate.InterpolatedUnivariateSpline(
-    #                 time_s,
-    #                 sbright[:, k]
-    #             )(self.run_data.hirex_time_combined[postinj])
-    #
-    #         if steady_ar is None:
-    #             # Interpolate vbright onto the VUV timebase(s):
-    #             vbright_interp = scipy.zeros((self.run_data.vuv_times_combined.shape[1], vbright.shape[1]))
-    #             for k in xrange(0, vbright.shape[1]):
-    #                 postinj = self.run_data.vuv_times_combined[k, :] >= param_source[1]
-    #                 vbright_interp[postinj, k] = scipy.interpolate.InterpolatedUnivariateSpline(
-    #                     time_v,
-    #                     vbright[:, k]
-    #                 )(self.run_data.vuv_times_combined[k, postinj])
-    #
-    #         # Plot the data if requested:
-    #         # Argon data:
-    #         if steady_ar is not None and (debug_plots or ar_f is not None):
-    #             if ar_f is None:
-    #                 ar_f, ar_a = self.run_data.plot_ar(boxplot=True, norm=True)
-    #             ar_a.plot(range(0, self.run_data.ar_signal.shape[1]), sbright[-1, :], color=lc, label=label, alpha=alpha)
-    #             ar_f.canvas.draw()
-    #
-    #         # Big HiReX-SR plot:
-    #         if debug_plots or big_f is not None:
-    #             if big_f is None:
-    #                 if steady_ar is None:
-    #                     big_f, a_H, a_V = self.run_data.plot_data()
-    #                 else:
-    #                     # Make the figure to hold the time-series data:
-    #                     big_f = plt.figure()
-    #                     ncol = 6
-    #                     nrow = int(scipy.ceil(1.0 * self.run_data.ar_signal.shape[1] / ncol))
-    #                     gs = mplgs.GridSpec(nrow, ncol)
-    #                     a_H = []
-    #                     i_col = 0
-    #                     i_row = 0
-    #                     for k in xrange(0, self.run_data.ar_signal.shape[1]):
-    #                         a_H.append(big_f.add_subplot(gs[i_row, i_col]))
-    #                         i_col += 1
-    #                         if i_col >= ncol:
-    #                             i_col = 0
-    #                             i_row += 1
-    #
-    #                     for k in xrange(0, len(a_H)):
-    #                         a_H[k].set_xlabel('$t$ [s]')
-    #                         a_H[k].set_ylabel('$b$ [AU]')
-    #                         a_H[k].set_title('HiReX-SR chord %d' % (k,))
-    #                         # a_H[k].set_ylim(bottom=0)
-    #             for a, k in zip(a_H, range(0, len(a_H))):
-    #                 l = a.plot(time_s, sbright[:, k], color=lc, alpha=alpha)
-    #                 a.plot(
-    #                     self.run_data.hirex_time_combined,
-    #                     sbright_interp[:, k],
-    #                     '.',
-    #                     color=plt.getp(l[0], 'color'),
-    #                     alpha=alpha
-    #                 )
-    #             if steady_ar is None:
-    #                 for a, k in zip(a_V, range(0, len(a_V))):
-    #                     l = a.plot(time_v, vbright[:, k], label=label, color=lc, alpha=alpha)
-    #                     a.plot(
-    #                         self.run_data.vuv_times_combined[k, :],
-    #                         vbright_interp[:, k],
-    #                         '.',
-    #                         color=plt.getp(l[0], 'color'),
-    #                         alpha=alpha
-    #                     )
-    #             big_f.canvas.draw()
-    #
-    #         # Form the squared differences and chi**2 itself:
-    #         if steady_ar is None:
-    #             s_squared_diff = (
-    #                 (sbright_interp - self.run_data.hirex_signal_norm_combined) /
-    #                 self.run_data.hirex_uncertainty_norm_combined
-    #             )**2.0
-    #             # TODO: This breaks if LoWEUS isn't present or is in a different
-    #             # spot or has different signs.
-    #             if True or self.include_loweus:
-    #                 v_squared_diff = (
-    #                     (vbright_interp - self.run_data.vuv_signals_norm_combined.T) /
-    #                     self.run_data.vuv_uncertainties_norm_combined.T
-    #                 )**2.0
-    #             else:
-    #                 v_squared_diff = (
-    #                     (vbright_interp[:, :-1] - self.run_data.vuv_signals_norm_combined[:-1, :].T) /
-    #                     self.run_data.vuv_uncertainties_norm_combined[:-1, :].T
-    #                 )**2.0
-    #
-    #             # Storing the elements of chi**2 like this will enable us to
-    #             # compute figures of merit like the WAIC.
-    #             chi2_arr = scipy.hstack(
-    #                 (
-    #                     s_squared_diff[~self.run_data.hirex_flagged_combined],
-    #                     v_squared_diff.ravel()
-    #                 )
-    #             )
-    #             # Go ahead and do the proper normalizations:
-    #             ll = -0.5 * chi2_arr.sum() + self.ll_normalization
-    #         else:
-    #             ar_mask = (self.run_data.ar_time >= self.time_1) & (self.run_data.ar_time <= self.time_2)
-    #             ar_signal = self.run_data.ar_signal[ar_mask, :]
-    #             ar_uncertainty = self.run_data.ar_uncertainty[ar_mask, :]
-    #             ar_flagged = self.run_data.ar_flagged[ar_mask, :]
-    #             ar_sim = scipy.tile(sbright[-1, :], (ar_signal.shape[0], 1))
-    #             s_squared_diff = ((ar_sim - ar_signal) / ar_uncertainty)**2.0
-    #             chi2_arr = s_squared_diff.ravel()[~ar_flagged.ravel()]
-    #             ll = -0.5 * chi2_arr.sum() + self.ar_ll_normalization
-    #
-    #         if no_prior:
-    #             lnprob = ll
-    #         else:
-    #             lnprob += ll
-    #
-    #         if scipy.isnan(lnprob):
-    #             lnprob = -scipy.inf
-    #
-    #         # Package the blob: store brightnesses only. The differences, D,
-    #         # V, and s are cheap to compute, so this will help keep the
-    #         # memory footprint down with many samples.
-    #         if return_blob:
-    #             if light_blob:
-    #                 blob = (ll,)
-    #             else:
-    #                 blob = (
-    #                     ll,
-    #                     sbright,
-    #                     vbright if steady_ar is None else None,
-    #                     time,
-    #                     out
-    #                 )
-    #
-    #     t_elapsed = time_.time() - t_start
-    #     print("Done. Elapsed time is %.3fs, ll=%.4g, lp=%.4g, lprior=%.4g" % (t_elapsed, ll, lnprob, lnprob - ll,))
-    #
-    #     if return_blob:
-    #         return (sign * lnprob, blob)
-    #     else:
-    #         return sign * lnprob
-    
-    def explore_optima_GMO(self, samples=100, algo=None, gp=None):
-        """Probe the space for local optima using PyGMO.
-        
-        Parameters
-        ----------
-        samples : int
-            Number of samples to take.
-        algo : :py:class:`PyGMO.algorithm` instance
-            Local optimizer to use.
-        gp : :py:class:`gptools.GaussianProcess` instance
-            If present, the starting points for the optimizer are taken to be
-            the `samples` best points in the training data of `gp` (which is
-            typically read using :py:meth:`assemble_surrogate`).
-        """
-        if algo is None:
-            algo = PyGMO.algorithm.nlopt_sbplx(max_iter=10000)
-        prob = MAPProblem(self)
-        if gp is not None:
-            pop = PyGMO.population(prob)
-            sort_args = gp.y.argsort()[::-1]
-            sort_args = sort_args[:samples]
-            X = gp.X[sort_args]
-            for x in X:
-                try:
-                    pop.push_back(x)
-                except ValueError:
-                    print("Incompatible sample skipped!")
-            inspector = PyGMO.util.analysis(pop, npoints='all')
-        else:
-            inspector = PyGMO.util.analysis(prob, samples)
-        inspector.local_search(clusters_to_show='all', plot_separate_pcp=False, algo=algo)
-        return inspector
-    
-    def iterate_inspector(self, inspector, algo=None, no_cluster=True, mask=None, thresh=-2e5):
-        """Start a new local optima search using the current cluster centers as
-        starting points.
-        """
-        if algo is None:
-            algo = PyGMO.algorithm.nlopt_sbplx(max_iter=10000)
-        prob = MAPProblem(self)
-        pop = PyGMO.population(prob)
-        bounds = scipy.asarray(self.get_prior().bounds[:], dtype=float)
-        lb = bounds[:, 0]
-        ub = bounds[:, 1]
-        
-        if no_cluster:
-            lp_vals = scipy.asarray(inspector.local_f)[:, 0]
-            lp_vals = -1 * (lp_vals * inspector.f_span + inspector.f_offset)
-            X = scipy.asarray(inspector.local_extrema)
-            for k in xrange(0, len(lb)):
-                X[:, k] = X[:, k] * (ub[k] - lb[k]) + lb[k]
-            if mask is None:
-                mask = scipy.ones_like(lp_vals, dtype=bool)
-            for lp, x, m in zip(lp_vals, X, mask):
-                if m and (lp >= thresh):
-                    pop.push_back(x)
-        else:
-            for x in inspector.local_cluster_x_centers:
-                # Need to remove the normalization before putting in place:
-                pop.push_back([xn * (u - l) + l for xn, u, l in zip(x, ub, lb)])
-        
-        inspector = PyGMO.util.analysis(pop, 'all')
-        inspector.local_search(clusters_to_show='all', plot_separate_pcp=False, algo=algo)
-        return inspector
-    
-    def visualize_all_minima(self, inspector, thresh=-2e5, plot_histories=False):
-        """Plot of the of the candidate local minima, along with scatterplots and histograms.
-        
-        Returns a mask of the "bad" fits, defined according to certain internal
-        criteria.
-        """
-        x = scipy.asarray(inspector.local_extrema)
-        # Remove the normalization:
-        lb = inspector.lb
-        ub = inspector.ub
-        # bounds = scipy.asarray(self.get_prior().bounds[:], dtype=float)
-        # lb = bounds[:, 0]
-        # ub = bounds[:, 1]
-        for k in xrange(0, len(lb)):
-            x[:, k] = x[:, k] * (ub[k] - lb[k]) + lb[k]
-        lp_vals = scipy.asarray(inspector.local_f)[:, 0]
-        # Remove the normalization:
-        lp_vals = -1 * (lp_vals * inspector.f_span + inspector.f_offset)
-        max_lp = lp_vals.max()
-        min_lp = lp_vals.min()
-        
-        f = plt.figure()
-        a_D = f.add_subplot(2, 1, 1)
-        a_V = f.add_subplot(2, 1, 2, sharex=a_D)
-        
-        f.suptitle("local extrema identified")
-        a_V.set_xlabel('$r/a$')
-        a_D.set_ylabel('$D$ [m$^2$/s]')
-        a_V.set_ylabel('$V$ [m/s]')
-        
-        # TODO: Make this generalized!
-        eig_D = []
-        eig_V = []
-        knots_D = []
-        knots_V = []
-        hp_D = []
-        hp_mu_D = []
-        hp_V = []
-        param_scaling = []
-        param_source = []
-        
-        for p in x:
-            peig_D, peig_V, pknots_D, pknots_V, php_D, php_mu_D, php_V, pparam_scaling, pparam_source = self.split_params(p)
-            eig_D.append(peig_D)
-            eig_V.append(peig_V)
-            knots_D.append(pknots_D)
-            knots_V.append(pknots_V)
-            hp_D.append(php_D)
-            hp_mu_D.append(php_mu_D)
-            hp_V.append(php_V)
-            param_scaling.append(pparam_scaling)
-            param_source.append(pparam_source)
-        
-        eig_D = scipy.asarray(eig_D)
-        eig_V = scipy.asarray(eig_V)
-        knots_D = scipy.asarray(knots_D)
-        knots_V = scipy.asarray(knots_V)
-        hp_D = scipy.asarray(hp_D)
-        hp_mu_D = scipy.asarray(hp_mu_D)
-        hp_V = scipy.asarray(hp_V)
-        param_scaling = scipy.asarray(param_scaling)
-        param_source = scipy.asarray(param_source)
-        
-        mask = (
-            (lp_vals > thresh) &
-            (knots_D != 0.0).all(axis=1) &
-            (knots_V != 0.0).all(axis=1) &
-            (knots_D != 1.05).all(axis=1) &
-            (knots_V != 1.05).all(axis=1) &
-            (eig_D != 30).all(axis=1) &
-            (eig_V != 200).all(axis=1) &
-            (eig_V != -200).all(axis=1) &
-            (knots_D >= self.roa_grid_DV[1]).all(axis=1) &
-            (knots_V >= self.roa_grid_DV[1]).all(axis=1) &
-            (knots_D <= self.roa_grid_DV[-2]).all(axis=1) &
-            (knots_V <= self.roa_grid_DV[-2]).all(axis=1)
-        )
-        
-        # mask = (
-        #     (lp_vals > thresh) &
-        #     (x[:, 12:18] != 0.0).all(axis=1) &
-        #     (x[:, 12:18] != 1.05).all(axis=1) &
-        #     (x[:, 0:6] != 30).all(axis=1) &
-        #     (x[:, 6:12] != 200).all(axis=1) &
-        #     # (x[:, 0] <= 10) &
-        #     # (x[:, 5] <= 25) &
-        #     (x[:, 6:12] != -200).all(axis=1) &
-        #     # (x[:, 12] != x[:, 13]) &
-        #     # (x[:, 12] != x[:, 13]) &
-        #     (x[:, 12:18] >= self.roa_grid_DV[1]).all(axis=1) &
-        #     (x[:, 12:18] <= self.roa_grid_DV[-2]).all(axis=1)
-        # )
-        max_adjusted_lp = lp_vals[mask].max()
-        
-        # Correct the knot ordering:
-        # TODO: Generalize this, too!
-        # for i in xrange(0, len(x)):
-        #     if x[i, 10] > x[i, 11]:
-        #         tmp = x[i, 10]
-        #         x[i, 10] = x[i, 11]
-        #         x[i, 11] = tmp
-        #     if x[i, 12] > x[i, 13]:
-        #         tmp = x[i, 12]
-        #         x[i, 12] = x[i, 13]
-        #         x[i, 13] = tmp
-        
-        for lp, X, m in zip(lp_vals, x, mask):
-            # if (lp >= -2e5) and not (X[10:14] == 0.0).any() and not (X[10:14] == 1.05).any() and not (X[0:5] == 50).any() and not (X[5:10] == 200).any():
-            # if (X[10:14] == 0.0).any() and (X[10:14] == 1.05).any():
-            #     color = 'm'
-            # elif (X[10:14] == 0.0).any():
-            #     color = 'g'
-            # elif (X[10:14] == 1.05).any():
-            #     color = 'r'
-            # else:
-            #     color = 'k'
-            if not m:
-                continue
-                color = 'r'
-                lw = 1
-            # elif (X[10:14] <= self.roa_grid_DV[1]).any() or (X[10:14] >= self.roa_grid_DV[-2]).any():
-            #     color = 'm'
-            #     lw = 0.05
-            elif lp == max_adjusted_lp:
-                color = 'b'
-                lw = 3
-            else:
-                color = 'k'
-                lw = 1
-            D, V = self.eval_DV(X)
-            a_D.plot(self.roa_grid_DV, D, color, alpha=max_lp / lp, linewidth=lw)
-            a_V.plot(self.roa_grid_DV, V, color, alpha=max_lp / lp, linewidth=lw)
-        
-        f = plt.figure()
-        a = f.add_subplot(1, 1, 1)
-        n, bins, patches = a.hist(lp_vals[lp_vals > thresh], bins=25, facecolor='b')
-        # a.hist(lp_vals[(x[:, 10:14] == 1.05).any(axis=1)], bins=bins, facecolor='r')
-        # a.hist(lp_vals[(x[:, 10:14] == 0.0).any(axis=1)], bins=bins, facecolor='g')
-        
-        # Make a scatterplot:
-        x_mod = scipy.asarray([x[mask, :],])
-        gptools.plot_sampler(
-            x_mod,
-            labels=self.get_labels(),
-            plot_samples=True,
-            plot_hist=True
-        )
-        
-        if plot_histories:
-            f, a_H, a_V = self.run_data.plot_data()
-            for lp, X, m in zip(lp_vals, x, mask):
-                if m:
-                    if lp == max_adjusted_lp:
-                        color = 'b'
-                    else:
-                        color = 'k'
-                    self.compute_ln_prob(X, lc=color, big_f=f, a_H=a_H, a_V=a_V, alpha=max_lp / lp)
-        
-        return (mask, lp_vals, x)
-    
-    def process_local_search(self, prefix):
-        """Plot the objective function against iteration number for a repeated local search.
-        """
-        files = glob.glob('../' + prefix + '*.pkl')
-        N = [int(re.search('.*?([0-9]+)\.pkl', f).group(1)) for f in files]
-        N.sort()
-        
-        lp_vals = []
-        for n in N:
-            print(n)
-            with open('../' + prefix + str(n) + '.pkl', 'rb') as f:
-                i = pkl.load(f)
-            
-            lp = scipy.asarray(i.local_f)[:, 0]
-            # Remove the normalization:
-            lp = lp * i.f_span + i.f_offset
-            # Remove infinite entries, since the mess up the plotting:
-            lp = lp[scipy.absolute(lp) != sys.float_info.max]
-            lp_vals.append(-1 * scipy.sort(lp))
-            
-        f = plt.figure()
-        a = f.add_subplot(1, 1, 1)
-        # We know the first file will have all of the points:
-        for k in range(0, len(lp_vals[0])):
-            lp = [-1 * l[k] for l in lp_vals if k < len(l)]
-            a.semilogy(range(1, len(lp) + 1), lp, '.-', label='k')
-        a.set_xlabel('iteration')
-        a.set_ylabel('-1 * log-posterior')
-        a.set_title('convergence of local search')
-        f.canvas.draw()
-        
-        return lp_vals
-    
-    def process_inspector(self, inspector, archi=None):
-        """Plot the candidate local extrema.
-        """
-        # In principle, these should have been computed -- but something went
-        # wrong on at least one trial, so instead I will loop over all of the
-        # clusters and evaluate it myself:
-        pool = multiprocessing.Pool(24)
-        ll_eval = _ComputeLnProbWrapper(self, make_dir=True, for_min=True, denormalize=True)
-        ll_vals = pool.map(ll_eval, inspector.local_cluster_x_centers)
-        pool.close()
-        ll_vals = -1 * scipy.asarray(ll_vals, dtype=float)
-        normalized = scipy.ones_like(ll_vals, dtype=bool)
-        
-        X = inspector.local_cluster_x_centers
-        
-        # If an archipelago is provided, add on its info:
-        if archi is not None:
-            champs = [i.population.champion for i in archi]
-            ll_vals = scipy.concatenate((ll_vals, [-1 * c.f[0] for c in champs]))
-            normalized = scipy.concatenate((normalized, scipy.zeros_like(champs, dtype=bool)))
-            X = scipy.concatenate((X, [c.x for c in champs]))
-        
-        max_ll = ll_vals.max()
-        
-        f = plt.figure()
-        a_D = f.add_subplot(2, 1, 1)
-        a_V = f.add_subplot(2, 1, 2, sharex=a_D)
-        bounds = scipy.asarray(self.get_prior().bounds[:], dtype=float)
-        lb = bounds[:, 0]
-        ub = bounds[:, 1]
-        
-        # f_ar, a_ar = self.run_data.plot_ar(boxplot=True, norm=True)
-        
-        for ll, x, n in zip(ll_vals, X, normalized):
-            if n:
-                xd = [xn * (u - l) + l for xn, u, l in zip(x, ub, lb)]
-            else:
-                xd = x
-            
-            D, V = self.eval_DV(xd)
-            a_D.plot(self.roa_grid_DV, D, 'k' if n else 'b', alpha=max_ll / ll)
-            a_V.plot(self.roa_grid_DV, V, 'k' if n else 'b', alpha=max_ll / ll)
-            
-            if ll == max_ll:
-                print('best!')
-                x_best = xd
-            
-            # self.compute_ln_prob(xd, debug_plots=True, steady_ar=1e17, ar_f=f_ar, ar_a=a_ar)
-        
-        D, V = self.eval_DV(x_best)
-        a_D.plot(self.roa_grid_DV, D, 'r', linewidth=4)
-        a_V.plot(self.roa_grid_DV, V, 'r', linewidth=4)
-        
-        a_V.set_xlabel('$r/a$')
-        a_D.set_ylabel('$D$ [m$^2$/s]')
-        a_V.set_ylabel('$V$ [m/s]')
-        f.suptitle("Comparison of local extrema")
-        
-        return (ll_vals, max_ll, x_best)
-    
-    def find_MAP_estimate_GMO(self):
-        """Globally optimize the log-posterior using PyGMO.
-        """
-        print("Starting global optimizer...")
-        # TODO: This needs to be tuned!
-        t_start = time_.time()
-        prob = MAPProblem(self)
-        # prob = PyGMO.problem.death_penalty(prob)
-        algo = PyGMO.algorithm.de(gen=10)
-        archi = PyGMO.archipelago(algo, prob, 24, 20)#, topology=PyGMO.topology.ring())
-        archi.evolve(10)
-        archi.join()
-        t_elapsed = time_.time() - t_start
-        print("Done. Elapsed time is %.1fs" % (t_elapsed,))
-        return (prob, algo, archi)
-    
-    def process_archi(self, archi):
-        """Make a plot of the possible global optima in an archipelago.
-        
-        The darkness of a curve is proportional to its fitness.
-        """
-        champs = [i.population.champion for i in archi]
-        ll = [-1 * c.f[0] for c in champs]
-        x = [c.x for c in champs]
-        
-        max_ll = max(ll)
-        print("max log-probability is %.3g" % (max_ll,))
-        
-        f = plt.figure()
-        a_D = f.add_subplot(2, 1, 1)
-        a_V = f.add_subplot(2, 1, 2, sharex=a_D)
-        for LL, X in zip(ll, x):
-            D, V = self.eval_DV(X)
-            a_D.plot(self.roa_grid_DV, D, 'r' if LL == max_ll else 'k', alpha=max_ll / LL)
-            a_V.plot(self.roa_grid_DV, V, 'k', alpha=max_ll / LL)
-        
-        a_V.set_xlabel('$r/a$')
-        a_D.set_ylabel('$D$ [m$^2$/s]')
-        a_V.set_ylabel('$V$ [m/s]')
-        f.suptitle("Comparison of solutions found")
     
     def find_MAP_estimate(self, random_starts=None, num_proc=None, pool=None, theta0=None, thresh=None):
         """Find the most likely parameters given the data.
@@ -4183,6 +3109,7 @@ class Run(object):
             )
             
             # Plot the actual data:
+            # TODO: This needs to be updated!
             t_idx_sr = profiletools.get_nearest_idx(time[0] - self.time_1, self.run_data.hirex_time_combined)
             line_data_sr, (erry_top_data_sr, erry_bot_data_sr), (barsy_data_sr,) = a_sr.errorbar(
                 range(sbright.shape[-1]),
@@ -4471,7 +3398,7 @@ class Run(object):
                 ((7 if self.clusters else 5) if self.source_file is None else 3)
             )
         if self.use_scaling:
-            ndim += 1 + self.run_data.vuv_signals_norm_combined.shape[0]
+            ndim += 1 + self.signals[1].y.shape[1]
         if burn is None:
             burn = nsamp // 2
         if num_proc is None:
@@ -4850,11 +3777,10 @@ class Run(object):
                 labels += ['$x_{D,%d}$' % (n + 1,) for n in xrange(0, self.num_eig_V - 1)]
         if self.use_scaling:
             labels += [r'$s$ H']
-            for k in xrange(0, self.run_data.vuv_signals_norm_combined.shape[0]):
+            for k in xrange(0, self.signals[1].y.shape[1]):
                 labels += [r'$s$ V%d' % (k + 1,)]
-            for k in self.run_data.xtomo_sig.keys():
-                if self.run_data.xtomo_sig[k] is not None:
-                    labels += [r'$s$ XTOMO %d' % (k,)]
+            for k in (1, 3):
+                labels += [r'$s$ XTOMO %d' % (k,)]
         labels += [r'$\Delta t$ H', r'$\Delta t$ V', r'$\Delta t$ XTOMO']
         if self.source_file is None:
             labels += ['$t_{rise}$', '$n_{rise}$', '$t_{fall}$', '$n_{fall}']
@@ -5050,6 +3976,7 @@ class Run(object):
         t_v = chain_flat[good, -1]
         
         # We need to interpolate sbright, vbright onto a uniform timebase:
+        # TODO: Update this!
         t = scipy.linspace(
             self.run_data.hirex_time_combined.min(),
             self.run_data.hirex_time_combined.max(),
@@ -5208,6 +4135,7 @@ class Run(object):
         chain histories. Interact with the chain histories using the arrow keys.
         """
         l = []
+        # TODO: Update this!
         f_b, a_H, a_VUV = self.run_data.plot_data()
         title_f_b = f_b.suptitle('')
         
@@ -5400,6 +4328,7 @@ class Run(object):
         # TODO: This way of dropping LoWEUS breaks if a.) LoWEUS is not loaded
         # or b.) if LoWEUS is not the last line or c.) if there are multiple
         # LoWEUS lines. This should be corrected at some point...
+        # TODO: Update this!
         if self._ll_normalization is None:
             good_err = scipy.hstack(
                 (
@@ -5450,26 +4379,93 @@ class Run(object):
         print("Created %s." % (new_dir,))
         
         # Switch to that directory to initialize the IDL side of things:
-        print("Running setup_strahl_run...")
-        os.chdir(new_dir)
-        cmd = "idl <<EOF\n.compile setup_strahl_run.pro\nsetup_strahl_run, {shot}, {time_1}, {time_2}".format(
-            shot=self.shot,
-            time_1=self.time_1,
-            time_2=self.time_2
-        )
-        try:
-            cmd += ', tht={tht}'.format(tht=self.tht)
-        except AttributeError:
-            pass
-        try:
-            cmd += ', line={line}'.format(line=self.line)
-        except AttributeError:
-            pass
-        cmd += '\nexit\nEOF'
+        if self.params_true is None:
+            print("Running setup_strahl_run...")
+            os.chdir(new_dir)
+            if not os.path.isfile('run_data.sav'):
+                cmd = "idl <<EOF\n.compile setup_strahl_run.pro\nsetup_strahl_run, {shot}, {time_1}, {time_2}".format(
+                    shot=self.shot,
+                    time_1=self.time_1,
+                    time_2=self.time_2
+                )
+                try:
+                    cmd += ', tht={tht}'.format(tht=self.tht)
+                except AttributeError:
+                    pass
+                try:
+                    cmd += ', line={line}'.format(line=self.line)
+                except AttributeError:
+                    pass
+                cmd += '\nexit\nEOF'
+                
+                subprocess.call(cmd, shell=True)
+            else:
+                print("run_data.sav already in place. You may want to make sure it matches!")
         
-        subprocess.call(cmd, shell=True)
-        
-        print("Setup of IDL files complete.")
+        print("Setup of files complete.")
+    
+    def write_atomdat(self, vuv_data):
+        """Write the Ca.atomdat file:
+        """
+        # TODO: This should be generalized for other HiReX-SR lines.
+        line_spec = LINE_SPEC_TEMPLATE.format(charge=18, wavelength=3.173, halfwidth=0.001)
+        # self.hirex_line_idx = 0
+        # self.xeus_line_idxs = []
+        # self.loweus_line_idxs = []
+        # k = 1
+        for spectrometer, s in vuv_data.vuv_lines.iteritems():
+            for l in s:
+                if l.diagnostic_lines is not None:
+                    # if spectrometer == 'XEUS':
+                    #     self.xeus_line_idxs.append(k)
+                    # elif spectrometer == 'LoWEUS':
+                    #     self.loweus_line_idxs.append(k)
+                    # k += 1
+                    # New way: pick the highest and lowest line, and go
+                    # 0.0001nm to either side:
+                    # Note that this assumes you haven't mixed charge states in
+                    # a given line, since STRAHL doesn't appear to support this!
+                    # TODO: I should be able to add support for that in my own
+                    # code, if needed.
+                    lam = CA_LINES[l.diagnostic_lines]
+                    i_max = lam.argmax()
+                    i_min = lam.argmin()
+                    l_max = lam[i_max]
+                    l_min = lam[i_min]
+                    cwl = (l_max + l_min) / 2.0
+                    halfwidth = (l_max - l_min) / 2.0 + 0.0001
+                    if max(l.diagnostic_lines) < len(CA_17_LINES):
+                        line_spec += LINE_SPEC_TEMPLATE.format(
+                            charge=17,
+                            wavelength=cwl * 10.0,
+                            halfwidth=halfwidth * 10.0
+                        )
+                    else:
+                        line_spec += LINE_SPEC_TEMPLATE.format(
+                            charge=16,
+                            wavelength=cwl * 10.0,
+                            halfwidth=halfwidth * 10.0
+                        )
+                    
+                    # Old way: put each line in with a tiny window:
+                    # for i in l.diagnostic_lines:
+                    #     if i < len(CA_17_LINES):
+                    #         line_spec += LINE_SPEC_TEMPLATE.format(
+                    #             charge=17,
+                    #             wavelength=CA_17_LINES[i] * 10.0
+                    #         )
+                    #     else:
+                    #         line_spec += LINE_SPEC_TEMPLATE.format(
+                    #             charge=16,
+                    #             wavelength=CA_16_LINES[i - len(CA_17_LINES)] * 10.0
+                    #         )
+        with open('Ca.atomdat', 'w') as f:
+            f.write(
+                CA_ATOMDAT_TEMPLATE.format(
+                    num_lines=len(line_spec.splitlines()),
+                    line_spec=line_spec
+                )
+            )
     
     def write_control(self, filepath=None, time_2_override=None):
         """Writes the strahl.control file used to automate STRAHL.
@@ -5809,36 +4805,55 @@ class Run(object):
         with open(self.source_file, 'w') as f:
             f.write(contents)
     
-    def compute_view_data(self, debug_plots=False, write=True, contour_axis=None, **kwargs):
+    def compute_view_data(self, debug_plots=False, contour_axis=None, **kwargs):
         """Compute the quadrature weights to line-integrate the emission profiles.
         
-        Writes the output to view_data.pkl.
+        Puts the results in the corresponding entries in signal.
+        
+        Parameters
+        ----------
+        debug_plots : bool, optional
+            If True, plots of the weights and chords will be produced. Default
+            is False (do not make plots).
+        contour_axis : axis instance, optional
+            If provided, plot the chords on this axis. All systems will be put
+            on the same axis! Default is to produce a new figure for each system.
+        **kwargs : additional keyword arguments, optional
+            All additional keyword arguments are passed to :py:meth:`DV2cs_den`
+            when running STRAHL to get the sqrtpsinorm grid used.
         """
-        # First, do a dummy run of STRAHL to get the grid:
-        # Just use random draws for the parameters, we just need it to run through:
+        # First, do a dummy run of STRAHL to get the grid. Just use random
+        # draws for the parameters, we just need it to run through:
         sqrtpsinormgrid = self.DV2cs_den(
             self.get_prior().random_draw(),
             compute_view_data=True,
             **kwargs
         )
-        # print(sqrtpsinormgrid)
         # Temporary HACK:
         sqrtpsinormgrid[sqrtpsinormgrid < 0] = 0.0
         
         tokamak = TRIPPy.plasma.Tokamak(self.efit_tree)
-        rays = [TRIPPy.beam.pos2Ray(p, tokamak) for p in self.run_data.hirex_pos]
-        rays.append(TRIPPy.beam.pos2Ray(self.run_data.xeus_pos, tokamak))
-        rays.append(TRIPPy.beam.pos2Ray(self.run_data.loweus_pos, tokamak))
         
-        ar_rays = [TRIPPy.beam.pos2Ray(p, tokamak) for p in self.run_data.ar_pos]
+        # TODO: This is hard-coded with which diagnostic is which, should
+        # probably be revised!
         
+        # Handle HiReX-SR:
+        rays = [TRIPPy.beam.pos2Ray(p, tokamak) for p in self.signals[0].pos]
+        # Handle XEUS:
+        XEUS_beam = TRIPPy.beam.pos2Ray(XEUS_POS, tokamak)
+        # Handle LoWEUS:
+        LoWEUS_beam = TRIPPy.beam.pos2Ray(LOWEUS_POS, tokamak)
+        # Handle HiReX-SR argon:
+        ar_rays = [TRIPPy.beam.pos2Ray(p, tokamak) for p in self.ar_signal.pos]
+        # Get xtomo beams:
         xtomo_1_beams = TRIPPy.XTOMO.XTOMO1beam(tokamak)
         xtomo_3_beams = TRIPPy.XTOMO.XTOMO3beam(tokamak)
         xtomo_5_beams = TRIPPy.XTOMO.XTOMO5beam(tokamak)
         
         # fluxFourierSens returns shape (n_time, n_chord, n_quad), we just have
         # one time element.
-        self.weights = TRIPPy.invert.fluxFourierSens(
+        # Handle HiReX-SR:
+        self.signals[0].weights = TRIPPy.invert.fluxFourierSens(
             rays,
             self.efit_tree.rz2psinorm,
             tokamak.center,
@@ -5846,8 +4861,33 @@ class Run(object):
             sqrtpsinormgrid**2.0,
             ds=1e-5
         )[0]
-        
-        self.ar_weights = TRIPPy.invert.fluxFourierSens(
+        # Handle XEUS and LoWEUS:
+        XEUS_weights = TRIPPy.invert.fluxFourierSens(
+            XEUS_beam,
+            self.efit_tree.rz2psinorm,
+            tokamak.center,
+            (self.time_1 + self.time_2) / 2.0,
+            sqrtpsinormgrid**2.0,
+            ds=1e-5
+        )[0]
+        LoWEUS_weights = TRIPPy.invert.fluxFourierSens(
+            LoWEUS_beam,
+            self.efit_tree.rz2psinorm,
+            tokamak.center,
+            (self.time_1 + self.time_2) / 2.0,
+            sqrtpsinormgrid**2.0,
+            ds=1e-5
+        )[0]
+        self.signals[1].weights = scipy.zeros(
+            (self.signals[1].y.shape[1], len(sqrtpsinormgrid))
+        )
+        for i, n in enumerate(self.signals[1].name):
+            if n == 'XEUS':
+                self.signals[1].weights[i, :] = XEUS_weights
+            else:
+                self.signals[1].weights[i, :] = LoWEUS_weights
+        # Handle HiReX-SR argon:
+        self.ar_signal.weights = TRIPPy.invert.fluxFourierSens(
             ar_rays,
             self.efit_tree.rz2psinorm,
             tokamak.center,
@@ -5855,9 +4895,9 @@ class Run(object):
             sqrtpsinormgrid**2.0,
             ds=1e-5
         )[0]
-        
-        self.xtomo_weights = {}
-        self.xtomo_weights[1] = TRIPPy.invert.fluxFourierSens(
+        # Handle XTOMO:
+        xtomo_weights = {}
+        xtomo_weights[1] = TRIPPy.invert.fluxFourierSens(
             xtomo_1_beams,
             self.efit_tree.rz2psinorm,
             tokamak.center,
@@ -5865,8 +4905,7 @@ class Run(object):
             sqrtpsinormgrid**2.0,
             ds=1e-5
         )[0]
-        
-        self.xtomo_weights[3] = TRIPPy.invert.fluxFourierSens(
+        xtomo_weights[3] = TRIPPy.invert.fluxFourierSens(
             xtomo_3_beams,
             self.efit_tree.rz2psinorm,
             tokamak.center,
@@ -5874,8 +4913,7 @@ class Run(object):
             sqrtpsinormgrid**2.0,
             ds=1e-5
         )[0]
-        
-        self.xtomo_weights[5] = TRIPPy.invert.fluxFourierSens(
+        xtomo_weights[5] = TRIPPy.invert.fluxFourierSens(
             xtomo_5_beams,
             self.efit_tree.rz2psinorm,
             tokamak.center,
@@ -5883,6 +4921,12 @@ class Run(object):
             sqrtpsinormgrid**2.0,
             ds=1e-5
         )[0]
+        
+        self.signals[2].weights = scipy.zeros(
+            (self.signals[2].y.shape[1], len(sqrtpsinormgrid))
+        )
+        for i, b in enumerate(self.signals[2].blocks):
+            self.signals[2].weights[i, :] = xtomo_weights[b][self.signals[2].weight_idxs[i], :]
         
         if debug_plots:
             i_flux = profiletools.get_nearest_idx(
@@ -5901,14 +4945,23 @@ class Run(object):
             
             f = plt.figure()
             a = f.add_subplot(1, 1, 1)
-            for w in self.weights:
+            for w in self.signals[0].weights:
                 a.plot(sqrtpsinormgrid**2, w, ls_cycle.next())
             a.set_xlabel(r"$\psi_n$")
             a.set_ylabel("quadrature weights")
-            a.set_title("Calcium")
+            a.set_title("HiReX-SR Calcium")
+            
+            f = plt.figure()
+            a = f.add_subplot(1, 1, 1)
+            for w in self.signals[1].weights:
+                a.plot(sqrtpsinormgrid**2, w, ls_cycle.next())
+            a.set_xlabel(r'$\psi_n$')
+            a.set_ylabel('quadrature weights')
+            a.set_title('VUV')
             
             ls_cycle = itertools.cycle(ls_vals)
             vuv_cycle = itertools.cycle(['b', 'g'])
+            
             
             from TRIPPy.plot.pyplot import plotTokamak, plotLine
             if contour_axis is None:
@@ -5920,10 +4973,10 @@ class Run(object):
                 a = contour_axis
                 plt.sca(a)
             # Plot VUV in different color:
-            for r in rays[:-2]:
+            for r in rays:
                 plotLine(r, pargs='r')#ls_cycle.next())
-            for r in rays[-2:]:
-                plotLine(r, pargs=vuv_cycle.next(), lw=3)
+            plotLine(XEUS_beam, pargs=vuv_cycle.next(), lw=3)
+            plotLine(LoWEUS_beam, pargs=vuv_cycle.next(), lw=3)
             if contour_axis is None:
                 a.contour(
                     self.efit_tree.getRGrid(),
@@ -5938,11 +4991,11 @@ class Run(object):
             
             f = plt.figure()
             a = f.add_subplot(1, 1, 1)
-            for w in self.ar_weights:
+            for w in self.ar_signal.weights:
                 a.plot(sqrtpsinormgrid**2, w, ls_cycle.next())
             a.set_xlabel(r"$\psi_n$")
             a.set_ylabel("quadrature weights")
-            a.set_title("HiReXSR, argon")
+            a.set_title("HiReX-SR, argon")
             
             ls_cycle = itertools.cycle(ls_vals)
             
@@ -5970,7 +5023,7 @@ class Run(object):
             
             f = plt.figure()
             a = f.add_subplot(1, 1, 1)
-            for w in self.xtomo_weights[1]:
+            for w in xtomo_weights[1]:
                 a.plot(sqrtpsinormgrid**2, w, ls_cycle.next())
             a.set_xlabel(r"$\psi_n$")
             a.set_ylabel("quadrature weights")
@@ -6002,7 +5055,7 @@ class Run(object):
             
             f = plt.figure()
             a = f.add_subplot(1, 1, 1)
-            for w in self.xtomo_weights[3]:
+            for w in xtomo_weights[3]:
                 a.plot(sqrtpsinormgrid**2, w, ls_cycle.next())
             a.set_xlabel(r"$\psi_n$")
             a.set_ylabel("quadrature weights")
@@ -6034,7 +5087,7 @@ class Run(object):
             
             f = plt.figure()
             a = f.add_subplot(1, 1, 1)
-            for w in self.xtomo_weights[5]:
+            for w in xtomo_weights[5]:
                 a.plot(sqrtpsinormgrid**2, w, ls_cycle.next())
             a.set_xlabel(r"$\psi_n$")
             a.set_ylabel("quadrature weights")
@@ -6060,14 +5113,6 @@ class Run(object):
                     50
                 )
             a.set_title("XTOMO 5")
-        
-        if write:
-            with open('view_data.pkl', 'wb') as f:
-                pkl.dump(self.weights, f)
-            with open('ar_view_data.pkl', 'wb') as f:
-                pkl.dump(self.ar_weights, f)
-            with open('xtomo_view_data.pkl', 'wb') as f:
-                pkl.dump(self.xtomo_weights, f)
         
         print("Done finding view data!")
     
@@ -6346,73 +5391,13 @@ class RunData(object):
     settings : :py:class:`Run` instance
         The imported settings to use.
     """
-    def __init__(self, settings):
-        self.settings = settings
-        
-        print("Reading run_data.sav...")
-        # Load the data from run_data.sav:
-        data = scipy.io.readsav('run_data.sav')
-        self.xeus_pos = scipy.asarray(data.xeus_pos, dtype=float)
-        self.loweus_pos = scipy.asarray(data.loweus_pos, dtype=float)
-        
-        # Line used for injections:
-        self.hirex_signal = scipy.asarray(data.hirex_data.srsignal[0], dtype=float)
-        self.hirex_uncertainty = scipy.asarray(data.hirex_data.srerr[0], dtype=float)
-        self.hirex_pos = scipy.asarray(data.hirex_data.pos[0], dtype=float)
-        self.hirex_time = scipy.asarray(data.hirex_data.t[0], dtype=float)
-        self.hirex_tht = data.hirex_data.tht[0]
-        self.hirex_line = data.hirex_data.line[0]
-        
-        # Argon line used for steady-state profile checking:
-        self.ar_signal = scipy.asarray(data.ar_data.srsignal[0], dtype=float)
-        self.ar_uncertainty = scipy.asarray(data.ar_data.srerr[0], dtype=float)
-        self.ar_pos = scipy.asarray(data.ar_data.pos[0], dtype=float)
-        self.ar_time = scipy.asarray(data.ar_data.t[0], dtype=float)
-        self.ar_tht = data.ar_data.tht[0]
-        self.ar_line = data.ar_data.line[0]
-        
-        self.shot = data.shot
-        self.time_1 = data.time_1
-        self.time_2 = data.time_2
-        
-        print("Processing HiReX-SR data...")
-        self.hirex_flagged = (
-            (self.hirex_uncertainty > HIREX_THRESH) |
-            (self.hirex_uncertainty == 0.0)
-        )
-        self.ar_flagged = (
-            (self.ar_uncertainty > HIREX_THRESH) |
-            (self.ar_uncertainty == 0.0)
-        )
-        
-        # Flag the bad HiReX-SR points:
-        self.flag_hirex()
-        self.flag_hirex(ar=True)
-        
-        if self.settings.debug_plots:
-            self.plot_hirex()
-            self.plot_hirex(ar=True)
-        
-        # Load the two VUV instruments:
-        # We use vuv_lines to write the atomdat file, so we need it to have a
-        # defined order:
-        self.vuv_lines = collections.OrderedDict()
-        self.vuv_signal = {}
-        self.vuv_time = {}
-        self.vuv_lam = {}
-        self.vuv_uncertainty = {}
-        
-        # Load the XEUS data:
-        self.load_vuv('XEUS')
-        
-        # Load the LoWEUS data:
-        # self.load_vuv('LoWEUS')
-        
-        # Write the atomdat file:
-        self.write_atomdat()
-        
-        # Load the source data:
-        # TODO: Load source data (once we have a shot it doesn't suck for...)
+    def __init__(self, shot, time_1, time_2, roa_grid, Te_args, ne_args):
+        self.shot = shot
+        self.roa_grid = roa_grid
+        self.time_1 = time_1
+        self.time_2 = time_2
+        self.Te_args = Te_args
+        self.ne_args = ne_args
         
         # Load the ne, Te data:
         print("Loading Te data...")
@@ -6421,384 +5406,24 @@ class RunData(object):
         print("Loading ne data...")
         self.load_ne()
         
-        print("Loading XTOMO data...")
-        self.load_xtomo()
-        self.flag_xtomo()
+        # print("Fetching source data...")
+        # # TODO: This needs to be generalized!
+        # shutil.copyfile(
+        #     self.settings.source_file,
+        #     'nete/Caflx%d.dat' % (self.settings.shot,)
+        # )
         
-        print("Processing injections...")
-        self.process_injections()
-        
-        self.plot_data()
-        
-        print("Fetching source data...")
-        # TODO: This needs to be generalized!
-        shutil.copyfile(
-            self.settings.source_file,
-            'nete/Caflx%d.dat' % (self.settings.shot,)
-        )
-        
-        print("Loading and processing of data complete.")
-    
-    def patch_data(self):
-        """Read the Ar data from an updated run_data.sav in to patch run_data.
-        """
-        print("Reading run_data.sav...")
-        # Load the data from run_data.sav:
-        data = scipy.io.readsav('run_data.sav')
-        
-        # Argon line used for steady-state profile checking:
-        self.ar_signal = scipy.asarray(data.ar_data.srsignal[0], dtype=float)
-        self.ar_uncertainty = scipy.asarray(data.ar_data.srerr[0], dtype=float)
-        self.ar_pos = scipy.asarray(data.ar_data.pos[0], dtype=float)
-        self.ar_time = scipy.asarray(data.ar_data.t[0], dtype=float)
-        self.ar_tht = data.ar_data.tht[0]
-        self.ar_line = data.ar_data.line[0]
-    
-    def flag_hirex(self, ar=False):
-        """Interactively flag bad points on HiReX-SR.
-        """
-        root = HirexWindow(self, ar=ar)
-        root.mainloop()
-    
-    def plot_hirex(self, z_max=None, norm=False, ar=False):
-        """Make a 3d scatterplot of the HiReX-SR data.
-        """
-        f = plt.figure()
-        a = f.add_subplot(1, 1, 1, projection='3d')
-        if norm:
-            t = self.hirex_time_combined
-            keep = ~(self.hirex_flagged_combined.ravel())
-            signal = self.hirex_signal_norm_combined
-            uncertainty = self.hirex_uncertainty_norm_combined
-        else:
-            if ar:
-                t = self.ar_time
-                keep = ~(self.ar_flagged.ravel())
-                signal = self.ar_signal
-                uncertainty = self.ar_uncertainty
-            else:
-                t = self.hirex_time
-                keep = ~(self.hirex_flagged.ravel())
-                signal = self.hirex_signal
-                uncertainty = self.hirex_uncertainty
-        CHAN, T = scipy.meshgrid(range(0, signal.shape[1]), t)
-        profiletools.errorbar3d(
-            a,
-            T.ravel()[keep],
-            CHAN.ravel()[keep],
-            signal.ravel()[keep],
-            zerr=uncertainty.ravel()[keep]
-        )
-        a.set_zlim(0, z_max)
-        a.set_xlabel('$t$ [s]')
-        a.set_ylabel('channel')
-        if norm:
-            a.set_zlabel('normalized and combined HiReX-SR signal')
-        else:
-            a.set_zlabel('HiReX-SR signal [AU]')
-    
-    # def plot_xtomo(self, norm=False):
-    #     """Make a 3d scatterplot of the XTOMO data.
-    #
-    #     DO NOT USE THIS FUNCTION -- IT WILL FREEZE YOUR PYTHON SESSION! TOO MANY
-    #     DATA!
-    #     """
-    #     # XTOMO 1:
-    #     f = plt.figure()
-    #     a = f.add_subplot(1, 1, 1, projection='3d')
-    #     if norm:
-    #         t = self.xtomo_time_combined[1]
-    #         signal = self.xtomo_signal_norm_combined[1]
-    #     else:
-    #         t = self.xtomo_t[1]
-    #         signal = self.xtomo_sig[1]
-    #     T, CHAN = scipy.meshgrid(t, range(0, signal.shape[0]))
-    #     a.scatter(CHAN.ravel(), T.ravel(), signal.ravel())
-    #     a.set_ylabel('$t$ [s]')
-    #     a.set_xlabel('channel')
-    #     if norm:
-    #         a.set_zlabel('normalized and combined XTOMO 1 signal')
-    #     else:
-    #         a.set_xlabel('XTOMO 1 signal [AU]')
-    
-    def plot_xtomo(self, system, norm=False, f=None, boxcar=1, share_y=False, y_title=0.9, y_label='$b$ [AU]', max_ticks=None, rot_label=False, suptitle=None):
-        """Make 2d scatterplots of the XTOMO data.
-        
-        Bad channels will be shown in red, good channels in blue. (But all will
-        be plotted...)
-        
-        Parameters
-        ----------
-        system : int
-            The XTOMO system to plot.
-        norm : bool, optional
-            If True, will plot the normalized data. Default is False (plot data
-            from tree).
-        f : Figure instance, optional
-            If provided, the plots will be drawn on this figure instance.
-        boxcar : int, optional
-            The number of boxcar points to use. Default is 1 (no smoothing).
-        """
-        if norm:
-            signal = self.xtomo_signal_norm_combined[system]
-            t = self.xtomo_times_combined[system]
-        else:
-            signal = self.xtomo_sig[system]
-            t = self.xtomo_t[system]
-        
-        if boxcar != 1:
-            sort = t.argsort()
-        else:
-            sort = scipy.ones_like(t, dtype=bool)
-        
-        if f is None:
-            f = plt.figure()
-        ncol = 6.0
-        nrow = scipy.ceil(1.0 * signal.shape[0] / ncol)
-        gs = mplgs.GridSpec(int(nrow), int(ncol))
-        a = []
-        i_col = 0
-        i_row = 0
-        for k in xrange(0, signal.shape[0]):
-            a.append(
-                f.add_subplot(
-                    gs[i_row, i_col],
-                    sharex=a[0] if len(a) >= 1 else None,
-                    sharey=a[0] if len(a) >= 1 and share_y else None
-                )
-            )
-            if i_col > 0 and share_y:
-                plt.setp(a[-1].get_yticklabels(), visible=False)
-            else:
-                a[-1].set_ylabel(y_label)
-            if i_row == nrow - 1 or i_row == nrow - 2 and i_col >= signal.shape[0] - (nrow - 1) * ncol:
-                a[-1].set_xlabel('$t$ [s]')
-                if rot_label:
-                    plt.setp(a[-1].xaxis.get_majorticklabels(), rotation=90)
-                    for tick in a[-1].get_yaxis().get_major_ticks():
-                        tick.label1 = tick._get_text1()
-            else:
-                plt.setp(a[-1].get_xticklabels(), visible=False)
-            i_col += 1
-            if i_col >= ncol:
-                i_col = 0
-                i_row += 1
-            
-            a[-1].set_title(
-                'chord {k:d}'.format(k=k), y=y_title
-            )
-            if boxcar == 1:
-                sig = signal[k, sort]
-            else:
-                sig = scipy.convolve(
-                    signal[k, sort],
-                    scipy.ones(int(boxcar)) / float(boxcar),
-                    mode='same'
-                )
-            a[-1].plot(
-                t[sort],
-                sig,
-                '.' if norm else '-',
-                color='b' if self.xtomo_channel_mask[system][k] else 'r'
-            )
-        
-        if max_ticks is not None:
-            for aa in a:
-                aa.xaxis.set_major_locator(plt.MaxNLocator(nbins=max_ticks - 1))
-                aa.yaxis.set_major_locator(plt.MaxNLocator(nbins=max_ticks - 1))
-        
-        if suptitle is None:
-            f.suptitle("XTOMO %d" % (system,))
-        else:
-            f.suptitle(suptitle)
-        
-        f.canvas.draw()
-        
-        return (f, a)
-    
-    @property
-    def ar_normalization(self):
-        # TODO: This should be cached!
-        CHAN, T = scipy.meshgrid(range(0, self.ar_signal.shape[1]), self.ar_time)
-        keep = ~((self.ar_flagged.ravel()) | (T.ravel() < self.time_1) | (T.ravel() > self.time_2))
-        return max(
-            [
-                scipy.median(self.ar_signal.ravel()[keep][CHAN.ravel()[keep] == c])
-                for c in range(0, self.ar_signal.shape[1])
-            ]
-        )
-    
-    def plot_ar(self, boxplot=False, norm=False):
-        """Make a 2d plot of the HiReX-SR argon data.
-        """
-        f = plt.figure()
-        a = f.add_subplot(1, 1, 1)
-        CHAN, T = scipy.meshgrid(range(0, self.ar_signal.shape[1]), self.ar_time)
-        keep = ~((self.ar_flagged.ravel()) | (T.ravel() < self.time_1) | (T.ravel() > self.time_2))
-        if norm:
-            normalization = self.ar_normalization
-        else:
-            normalization = 1.0
-        if boxplot:
-            # TODO: This write this more elegantly!
-            a.boxplot(
-                [
-                    self.ar_signal.ravel()[keep][CHAN.ravel()[keep] == c] / normalization
-                    for c in range(0, self.ar_signal.shape[1])
-                ]
-            )
-        else:
-            a.errorbar(
-                CHAN.ravel()[keep],
-                self.ar_signal.ravel()[keep] / normalization,
-                yerr=self.ar_uncertainty.ravel()[keep] / normalization,
-                fmt='.'
-            )
-        a.set_xlabel('channel')
-        a.set_ylabel('HiReX-SR signal [AU]')
-        
-        return (f, a)
-    
-    def load_vuv(self, system):
-        """Load the data from a VUV instrument.
-        
-        Parameters
-        ----------
-        system : {'XEUS', 'LoWEUS'}
-            The VUV instrument to load the data from.
-        """
-        print("Loading {system} data...".format(system=system))
-        self.vuv_lines[system] = []
-        t = MDSplus.Tree('spectroscopy', self.settings.shot)
-        N = t.getNode(system + '.spec')
-        self.vuv_signal[system] = scipy.asarray(N.data(), dtype=float)
-        self.vuv_time[system] = scipy.asarray(N.dim_of(idx=1).data(), dtype=float)
-        self.vuv_lam[system] = scipy.asarray(N.dim_of(idx=0).data(), dtype=float) / 10.0
-        
-        # Get the raw count data to compute the uncertainty:
-        self.vuv_uncertainty[system] = (
-            self.vuv_signal[system] /
-            scipy.sqrt(t.getNode(system + '.raw:data').data())
-        )
-        
-        print("Processing {system} data...".format(system=system))
-        self.select_vuv(system)
-    
-    def select_vuv(self, system):
-        """Select the lines to use from the given VUV spectrometer.
-        """
-        # TODO: Make a way to specify this manually in the settings file!
-        root = VuvWindow(self, system)
-        root.mainloop()
-    
-    def plot_vuv(self, system):
-        """Make a contour plot of the VUV spectrum.
-        """
-        f = plt.figure()
-        a = f.add_subplot(1, 1, 1)
-        LAM, T = scipy.meshgrid(self.vuv_lam[system], self.vuv_time[system])
-        a.pcolormesh(
-            LAM,
-            T,
-            self.vuv_signal[system],
-            cmap='gray'
-        )
-        xlim = a.get_xlim()
-        for x in CA_17_LINES:
-            a.axvline(x, color='r')
-        for x in CA_16_LINES:
-            a.axvline(x, color='c')
-        a.set_xlim(xlim)
-        a.set_xlabel(r'$\lambda$ [nm]')
-        a.set_ylabel('$t$ [s]')
-    
-    def plot_vuv_normed(self):
-        """Plot each of the normalized VUV lines in a separate figure.
-        """
-        for k in xrange(0, self.vuv_signals_norm_combined.shape[0]):
-            f = plt.figure()
-            a = f.add_subplot(1, 1, 1)
-            a.errorbar(
-                self.vuv_times_combined[k, :],
-                self.vuv_signals_norm_combined[k, :],
-                yerr=self.vuv_uncertainties_norm_combined[k, :],
-                fmt='.'
-            )
-            a.set_xlabel('$t$ [s]')
-            a.set_ylabel('normalized signal')
-    
-    def write_atomdat(self):
-        """Write the Ca.atomdat file:
-        """
-        # TODO: This should be generalized for other HiReX-SR lines.
-        line_spec = LINE_SPEC_TEMPLATE.format(charge=18, wavelength=3.173, halfwidth=0.001)
-        self.hirex_line_idx = 0
-        self.xeus_line_idxs = []
-        self.loweus_line_idxs = []
-        k = 1
-        for spectrometer, s in self.vuv_lines.iteritems():
-            for l in s:
-                if l.diagnostic_lines is not None:
-                    if spectrometer == 'XEUS':
-                        self.xeus_line_idxs.append(k)
-                    elif spectrometer == 'LoWEUS':
-                        self.loweus_line_idxs.append(k)
-                    k += 1
-                    # New way: pick the highest and lowest line, and go
-                    # 0.0001nm to either side:
-                    # Note that this assumes you haven't mixed charge states in
-                    # a given line, since STRAHL doesn't appear to support this!
-                    # TODO: I should be able to add support for that in my own
-                    # code, if needed.
-                    lam = CA_LINES[l.diagnostic_lines]
-                    i_max = lam.argmax()
-                    i_min = lam.argmin()
-                    l_max = lam[i_max]
-                    l_min = lam[i_min]
-                    cwl = (l_max + l_min) / 2.0
-                    halfwidth = (l_max - l_min) / 2.0 + 0.0001
-                    if max(l.diagnostic_lines) < len(CA_17_LINES):
-                        line_spec += LINE_SPEC_TEMPLATE.format(
-                            charge=17,
-                            wavelength=cwl * 10.0,
-                            halfwidth=halfwidth * 10.0
-                        )
-                    else:
-                        line_spec += LINE_SPEC_TEMPLATE.format(
-                            charge=16,
-                            wavelength=cwl * 10.0,
-                            halfwidth=halfwidth * 10.0
-                        )
-                    
-                    # Old way: put each line in with a tiny window:
-                    # for i in l.diagnostic_lines:
-                    #     if i < len(CA_17_LINES):
-                    #         line_spec += LINE_SPEC_TEMPLATE.format(
-                    #             charge=17,
-                    #             wavelength=CA_17_LINES[i] * 10.0
-                    #         )
-                    #     else:
-                    #         line_spec += LINE_SPEC_TEMPLATE.format(
-                    #             charge=16,
-                    #             wavelength=CA_16_LINES[i - len(CA_17_LINES)] * 10.0
-                    #         )
-        with open('Ca.atomdat', 'w') as f:
-            f.write(
-                CA_ATOMDAT_TEMPLATE.format(
-                    num_lines=len(line_spec.splitlines()),
-                    line_spec=line_spec
-                )
-            )
+        print("Loading and processing of run data complete.")
     
     def load_Te(self):
         """Load and fit the Te data using gpfit.
         """
-        self.Te_X, self.Te_res, self.Te_p = self.load_prof('Te', self.settings.Te_args)
+        self.Te_X, self.Te_res, self.Te_p = self.load_prof('Te', self.Te_args)
     
     def load_ne(self):
         """Load and fit the ne data using gpfit.
         """
-        self.ne_X, self.ne_res, self.ne_p = self.load_prof('ne', self.settings.ne_args)
+        self.ne_X, self.ne_res, self.ne_p = self.load_prof('ne', self.ne_args)
     
     def load_prof(self, prof, flags):
         """Load the specified profile using gpfit.
@@ -6817,21 +5442,536 @@ class RunData(object):
         )
         argv = [
             '--signal', prof,
-            '--shot', str(self.settings.shot),
-            '--t-min', str(self.settings.time_1),
-            '--t-max', str(self.settings.time_2),
+            '--shot', str(self.shot),
+            '--t-min', str(self.time_1),
+            '--t-max', str(self.time_2),
             '--coordinate', 'r/a',
             '--no-a-over-L',
             '--x-pts'
         ]
-        argv += [str(x) for x in self.settings.roa_grid]
+        argv += [str(x) for x in self.roa_grid]
         argv += flags
         return profiletools.gui.run_gui(argv=argv)
-    
-    def load_xtomo(self):
-        """Load the data from each of the three XTOMO systems.
+
+class Injection(object):
+    """Class to store information on a given injection.
+    """
+    def __init__(self, t_inj, t_start, t_stop):
+        self.t_inj = t_inj
+        self.t_start = t_start
+        self.t_stop = t_stop
+
+class Signal(object):
+    def __init__(self, y, std_y, y_norm, std_y_norm, t, name, atomdat_idx, pos=None, sqrtpsinorm=None, weights=None, blocks=0):
+        """Class to store the data from a given diagnostic.
+        
+        In the parameter descriptions, `n` is the number of signals (both
+        spatial and temporal) contained in the instance.
+        
+        Parameters
+        ----------
+        y : array, (`n_time`, `n`)
+            The unnormalized, baseline-subtracted data as a function of time and
+            space. If `pos` is not None, "space" refers to the chords. Wherever
+            there is a bad point, it should be set to NaN.
+        std_y : array, (`n_time`, `n`)
+            The uncertainty in the unnormalized, baseline-subtracted data as a
+            function of time and space.
+        y_norm : array, (`n_time`, `n`)
+            The normalized, baseline-subtracted data.
+        std_y_norm : array, (`n_time`, `n`)
+            The uncertainty in the normalized, baseline-subtracted data.
+        t : array, (`n_time`,)
+            The time vector of the data.
+        name : str
+            The name of the signal.
+        atomdat_idx : int or array of int, (`n`,)
+            The index or indices of the signals in the atomdat file. If a single
+            value is given, it is used for all of the signals. If a 1d array is
+            provided, these are the indices for each of the signals in `y`. If
+            `atomdat_idx` (or one of its entries) is -1, it will be treated as
+            an SXR measurement.
+        pos : array, (4,) or (`n`, 4), optional
+            The POS vector(s) for line-integrated data. If not present, the data
+            are assumed to be local measurements at the locations in
+            `sqrtpsinorm`. If a 1d array is provided, it is used for all of the
+            chords in `y`. Otherwise, there must be one pos vector for each of
+            the chords in `y`.
+        sqrtpsinorm : array, (`n`,), optional
+            The square root of poloidal flux grid the (local) measurements are
+            given on. If line-integrated measurements with the standard STRAHL
+            grid for their quadrature points are to be used this should be left
+            as None.
+        weights : array, (`n`, `n_quadrature`), optional
+            The quadrature weights to use. This can be left as None for a local
+            measurement or can be set later.
+        blocks : int or array of int, (`n`), optional
+            A set of flags indicating which channels in the :py:class:`Signal`
+            should be treated together as a block when normalizing. If a single
+            int is given, all of the channels will be taken together. Otherwise,
+            any channels sharing the same block number will be taken together.
         """
-        tree = MDSplus.Tree('xtomo', self.settings.shot)
+        self.y = scipy.asarray(y, dtype=float)
+        if self.y.ndim != 2:
+            raise ValueError("y must have two dimensions!")
+        self.std_y = scipy.asarray(std_y, dtype=float)
+        if self.y.shape != self.std_y.shape:
+            raise ValueError("The shapes of y and std_y must match!")
+        self.y_norm = scipy.asarray(y_norm, dtype=float)
+        if self.y.shape != self.y_norm.shape:
+            raise ValueError("The shapes of y and y_norm must match!")
+        self.std_y_norm = scipy.asarray(std_y_norm, dtype=float)
+        if self.std_y_norm.shape != self.y.shape:
+            raise ValueError("The shapes of y and std_y_norm must match!")
+        self.t = scipy.asarray(t, dtype=float)
+        if self.t.ndim != 1:
+            raise ValueError("t must have one dimension!")
+        if len(self.t) != self.y.shape[0]:
+            raise ValueError("The length of t must equal the length of the leading dimension of y!")
+        if isinstance(name, str):
+            name = [name,] * self.y.shape[1]
+        self.name = name
+        try:
+            iter(atomdat_idx)
+        except TypeError:
+            self.atomdat_idx = atomdat_idx * scipy.ones(self.y.shape[1], dtype=int)
+        else:
+            self.atomdat_idx = scipy.asarray(atomdat_idx, dtype=int)
+            if self.atomdat_idx.ndim != 1:
+                raise ValueError("atomdat_idx must have at most one dimension!")
+            if len(self.atomdat_idx) != self.y.shape[1]:
+                raise ValueError("1d atomdat_idx must have the same number of elements as the second dimension of y!")
+        if pos is not None:
+            pos = scipy.asarray(pos, dtype=float)
+            if pos.ndim not in (1, 2):
+                raise ValueError("pos must have one or two dimensions!")
+            if pos.ndim == 1 and len(pos) != 4:
+                raise ValueError("pos must have 4 elements!")
+            if pos.ndim == 2 and (pos.shape[0] != self.y.shape[1] or pos.shape[1] != 4):
+                raise ValueError("pos must have shape (n, 4)!")
+        
+        self.pos = pos
+        self.sqrtpsinorm = sqrtpsinorm
+        
+        self.weights = weights
+        
+        try:
+            iter(blocks)
+        except TypeError:
+            self.blocks = blocks * scipy.ones(self.y.shape[1], dtype=int)
+        else:
+            self.blocks = scipy.asarray(blocks, dtype=int)
+            if self.blocks.ndim != 1:
+                raise ValueError("blocks must have at most one dimension!")
+            if len(self.blocks) != self.y.shape[1]:
+                raise ValueError("1d blocks must have the same number of elements as the second dimension of y!")
+    
+    def plot_data(self, norm=False, f=None, share_y=False, y_label='$b$ [AU]', max_ticks=None, rot_label=False):
+        """Make a big plot with all of the data.
+        
+        Parameters
+        ----------
+        norm : bool, optional
+            If True, plot the normalized data. Default is False (plot
+            unnormalized data).
+        f : :py:class:`Figure`, optional
+            The figure instance to make the subplots in. If not provided, a
+            figure will be created.
+        share_y : bool, optional
+            If True, the y axes of all of the subplots will have the same scale.
+            Default is False (each y axis is automatically scaled individually).
+        y_label : str, optional
+            The label to use for the y axes. Default is '$b$ [AU]'.
+        max_ticks : int, optional
+            The maximum number of ticks on the x and y axes. Default is no limit.
+        rot_label : bool, optional
+            If True, the x axis labels will be rotated 90 degrees. Default is
+            False (do not rotate).
+        """
+        if norm:
+            y = self.y_norm
+            std_y = self.std_y_norm
+        else:
+            y = self.y
+            std_y = self.std_y
+        
+        if f is None:
+            f = plt.figure()
+        
+        ncol = min(6, self.y.shape[1])
+        nrow = int(scipy.ceil(1.0 * self.y.shape[1] / ncol))
+        gs = mplgs.GridSpec(nrow, ncol)
+        
+        a = []
+        i_col = 0
+        i_row = 0
+        
+        for k in xrange(0, self.y.shape[1]):
+            a.append(
+                f.add_subplot(
+                    gs[i_row, i_col],
+                    sharex=a[0] if len(a) >= 1 else None,
+                    sharey=a[0] if len(a) >= 1 and share_y else None
+                )
+            )
+            if i_col > 0 and share_y:
+                plt.setp(a[-1].get_yticklabels(), visible=False)
+            else:
+                a[-1].set_ylabel(y_label)
+            if i_row < nrow - 2 or (i_row == nrow - 2 and i_col < self.y.shape[1] % (nrow - 1)):
+                plt.setp(a[-1].get_xticklabels(), visible=False)
+            else:
+                a[-1].set_xlabel('$t$ [s]')
+                if rot_label:
+                    plt.setp(a[-1].xaxis.get_majorticklabels(), rotation=90)
+            i_col += 1
+            if i_col >= ncol:
+                i_col = 0
+                i_row += 1
+            a[-1].set_title('%s, %d' % (self.name[k], k))
+            good = ~scipy.isnan(self.y[:, k])
+            a[-1].errorbar(
+                self.t[good],
+                y[good, k],
+                yerr=std_y[good, k],
+                fmt='.'
+            )
+            if max_ticks is not None:
+                a[-1].xaxis.set_major_locator(plt.MaxNLocator(nbins=max_ticks - 1))
+                a[-1].yaxis.set_major_locator(plt.MaxNLocator(nbins=max_ticks - 1))
+        
+        if share_y:
+            a[0].set_ylim(bottom=0.0)
+            a[0].set_xlim(self.t.min(), self.t.max())
+        
+        f.canvas.draw()
+        
+        return (f, a)
+
+class HirexData(object):
+    """Helper object to load and process the HiReX-SR data.
+    
+    Can load either the Ca or the Ar data.
+    
+    The sequence of operations is as follows:
+    
+    * Load the relevant data from 'run_data.sav'.
+    * Launch a GUI to flag/unflag possible outliers.
+    * If requested, plot the raw data.
+    * Parcel the data into injections, normalize and combine.
+    * Generate a :py:class:`Signal` containing the data. This is stored in the
+      attribute :py:attr:`self.signal` for later use.
+    
+    Parameters
+    ----------
+    injections : list of :py:class:`Injection`
+        The injections the data are to be grouped into.
+    ar : bool, optional
+        If True, the argon data are loaded. Otherwise the Ca data are loaded.
+        Default is False (load Ca data).
+    debug_plots : bool, optional
+        If True, plots are made. Default is False.
+    """
+    def __init__(self, injections, ar=False, debug_plots=False):
+        data = scipy.io.readsav('run_data.sav')
+        if ar:
+            self.hirex_signal = scipy.asarray(data.ar_data.srsignal[0], dtype=float)
+            self.hirex_uncertainty = scipy.asarray(data.ar_data.srerr[0], dtype=float)
+            self.hirex_pos = scipy.asarray(data.ar_data.pos[0], dtype=float)
+            self.hirex_time = scipy.asarray(data.ar_data.t[0], dtype=float)
+            self.hirex_tht = data.ar_data.tht[0]
+            self.hirex_line = data.ar_data.line[0]
+        else:
+            self.hirex_signal = scipy.asarray(data.hirex_data.srsignal[0], dtype=float)
+            self.hirex_uncertainty = scipy.asarray(data.hirex_data.srerr[0], dtype=float)
+            self.hirex_pos = scipy.asarray(data.hirex_data.pos[0], dtype=float)
+            self.hirex_time = scipy.asarray(data.hirex_data.t[0], dtype=float)
+            self.hirex_tht = data.hirex_data.tht[0]
+            self.hirex_line = data.hirex_data.line[0]
+        
+        self.shot = data.shot
+        self.time_1 = data.time_1
+        self.time_2 = data.time_2
+        
+        self.hirex_flagged = (
+            (self.hirex_uncertainty > HIREX_THRESH) |
+            (self.hirex_uncertainty == 0.0)
+        )
+        
+        # Flag bad points:
+        root = HirexWindow(self, ar=ar)
+        root.mainloop()
+        
+        if debug_plots:
+            f = self.plot_data()
+        
+        # Process the injections:
+        if not ar:
+            t = []
+            y = []
+            std_y = []
+            y_norm = []
+            std_y_norm = []
+            
+            for k, i in enumerate(injections):
+                t_hirex_start, t_hirex_stop = profiletools.get_nearest_idx(
+                    [i.t_start, i.t_stop],
+                    self.hirex_time
+                )
+                hirex_signal = self.hirex_signal[t_hirex_start:t_hirex_stop + 1, :]
+                hirex_flagged = self.hirex_flagged[t_hirex_start:t_hirex_stop + 1, :]
+                hirex_uncertainty = self.hirex_uncertainty[t_hirex_start:t_hirex_stop + 1, :]
+                hirex_time = self.hirex_time[t_hirex_start:t_hirex_stop + 1] - i.t_inj
+                
+                # Normalize to the brightest interpolated max on the brightest
+                # chord:
+                maxs = scipy.zeros(hirex_signal.shape[1])
+                s_maxs = scipy.zeros_like(maxs)
+                for j in xrange(0, hirex_signal.shape[1]):
+                    good = ~hirex_flagged[:, j]
+                    maxs[j], s_maxs[j] = interp_max(
+                        hirex_time[good],
+                        hirex_signal[good, j],
+                        err_y=hirex_uncertainty[good, j],
+                        debug_plots=debug_plots,
+                        method='GP'
+                    )
+                
+                i_max = maxs.argmax()
+                m = maxs[i_max]
+                s = s_maxs[i_max]
+                
+                hirex_signal[hirex_flagged] = scipy.nan
+                
+                t.append(hirex_time)
+                y.append(hirex_signal)
+                std_y.append(hirex_uncertainty)
+                y_norm.append(hirex_signal / m)
+                std_y_norm.append(scipy.sqrt((hirex_uncertainty / m)**2.0 + (s / m)**2.0))
+            
+            self.signal = Signal(
+                scipy.vstack(y),
+                scipy.vstack(std_y),
+                scipy.vstack(y_norm),
+                scipy.vstack(std_y_norm),
+                scipy.hstack(t),
+                'HiReX-SR',
+                0,
+                pos=self.hirex_pos
+            )
+        else:
+            t_mask = (self.hirex_time >= self.time_1) & (self.hirex_time <= self.time_2)
+            
+            self.hirex_signal = self.hirex_signal[t_mask, :]
+            self.hirex_uncertainty = self.hirex_uncertainty[t_mask, :]
+            self.hirex_time = self.hirex_time[t_mask]
+            self.hirex_flagged = self.hirex_flagged[t_mask, :]
+            
+            self.hirex_signal[self.hirex_flagged] = scipy.nan
+            
+            normalization = scipy.nanmax(self.hirex_signal)
+            
+            
+            self.signal = Signal(
+                self.hirex_signal,
+                self.hirex_uncertainty,
+                self.hirex_signal / normalization,
+                self.hirex_uncertainty / normalization,
+                self.hirex_time,
+                'HiReX-SR (Ar)',
+                0,
+                pos=self.hirex_pos
+            )
+    
+    def plot_data(self, z_max=None):
+        """Make a 3d scatterplot of the data.
+        
+        Parameters
+        ----------
+        z_max : float, optional
+            The maximum value for the z axis. Default is None (no limit).
+        norm : bool, optional
+            If True, plot the normalized, combined data. Default is False (plot
+            the unnormalized, raw data).
+        """
+        f = plt.figure()
+        a = f.add_subplot(1, 1, 1, projection='3d')
+        t = self.hirex_time
+        keep = ~(self.hirex_flagged.ravel())
+        signal = self.hirex_signal
+        uncertainty = self.hirex_uncertainty
+        CHAN, T = scipy.meshgrid(range(0, signal.shape[1]), t)
+        profiletools.errorbar3d(
+            a,
+            T.ravel()[keep],
+            CHAN.ravel()[keep],
+            signal.ravel()[keep],
+            zerr=uncertainty.ravel()[keep]
+        )
+        a.set_zlim(0, z_max)
+        a.set_xlabel('$t$ [s]')
+        a.set_ylabel('channel')
+        a.set_zlabel('HiReX-SR signal [AU]')
+        
+        return f
+
+class VUVData(object):
+    """Helper object to load and process the VUV data.
+    
+    Execution proceeds as follows:
+    
+    * Loads the XEUS data.
+    * Allows user to select lines, background subtraction intervals.
+    * Loads the LoWEUS data.
+    * Allows the user to select lines, background subtraction intervals.
+    * Computes the normalization factors.
+    * Loads the data into a :py:class:`Signal` instance. This is stored in the
+      attribute :py:attr:`signal` for later use.
+    """
+    def __init__(self, shot, injections, debug_plots=False):
+        self.shot = shot
+        
+        self.vuv_lines = collections.OrderedDict()
+        self.vuv_signal = {}
+        self.vuv_time = {}
+        self.vuv_lam = {}
+        self.vuv_uncertainty = {}
+        
+        self.load_vuv('XEUS')
+        try:
+            self.load_vuv('LoWEUS')
+        except:
+            print("Could not load LoWEUS data.")
+        
+        t = []
+        y = []
+        std_y = []
+        y_norm = []
+        std_y_norm = []
+        
+        for k, i in enumerate(injections):
+            vuv_signals = []
+            vuv_uncertainties = []
+            vuv_times = []
+            
+            for s in self.vuv_lines.keys():
+                i_start, i_stop = profiletools.get_nearest_idx(
+                    [i.t_start, i.t_stop],
+                    self.vuv_time[s]
+                )
+                for l in self.vuv_lines[s]:
+                    if l.diagnostic_lines is not None:
+                        vuv_signals.append(
+                            l.signal[i_start:i_stop + 1]
+                        )
+                        vuv_uncertainties.append(
+                            l.uncertainty[i_start:i_stop + 1]
+                        )
+                        vuv_times.append(
+                            self.vuv_time[s][i_start:i_stop + 1] - i.t_inj
+                        )
+            vuv_signals = scipy.asarray(vuv_signals)
+            vuv_uncertainties = scipy.asarray(vuv_uncertainties)
+            vuv_times = scipy.asarray(vuv_times)
+            
+            # We don't have a brightness cal for XEUS or LoWEUS, so normalize to
+            # the peak:
+            vuv_signals_norm = scipy.nan * scipy.zeros_like(vuv_signals)
+            vuv_uncertainties_norm = scipy.nan * scipy.zeros_like(vuv_uncertainties)
+            
+            for j in xrange(0, vuv_signals.shape[0]):
+                m, s = interp_max(
+                    vuv_times[j, :],
+                    vuv_signals[j, :],
+                    err_y=vuv_uncertainties[j, :],
+                    debug_plots=debug_plots,
+                    s_max=100.0
+                )
+                vuv_signals_norm[j, :] = vuv_signals[j, :] / m
+                vuv_uncertainties_norm[j, :] = (
+                    scipy.sqrt(
+                        (vuv_uncertainties[j, :] / m)**2.0 + (s / m)**2.0
+                    )
+                )
+            
+            # Assume all are on the same timebase:
+            t.append(vuv_times[0])
+            y.append(vuv_signals)
+            std_y.append(vuv_uncertainties)
+            y_norm.append(vuv_signals_norm)
+            std_y_norm.append(vuv_uncertainties_norm)
+        
+        blocks = []
+        names = []
+        pos = []
+        i = 0
+        for s in self.vuv_lines.keys():
+            for l in self.vuv_lines[s]:
+                if l.diagnostic_lines is not None:
+                    blocks.append(i)
+                    i += 1
+                    names.append(s)
+                    pos.append(XEUS_POS if s == 'XEUS' else LOWEUS_POS)
+        
+        self.signal = Signal(
+            scipy.hstack(y).T,
+            scipy.hstack(std_y).T,
+            scipy.hstack(y_norm).T,
+            scipy.hstack(std_y_norm).T,
+            scipy.hstack(t),
+            names,
+            scipy.asarray(blocks, dtype=int) + 1,
+            pos=pos,
+            blocks=blocks
+        )
+    
+    def load_vuv(self, system):
+        """Load the data from a VUV instrument.
+        
+        Parameters
+        ----------
+        system : {'XEUS', 'LoWEUS'}
+            The VUV instrument to load the data from.
+        """
+        print("Loading {system} data...".format(system=system))
+        t = MDSplus.Tree('spectroscopy', self.shot)
+        N = t.getNode(system + '.spec')
+        self.vuv_lines[system] = []
+        self.vuv_signal[system] = scipy.asarray(N.data(), dtype=float)
+        self.vuv_time[system] = scipy.asarray(N.dim_of(idx=1).data(), dtype=float)
+        self.vuv_lam[system] = scipy.asarray(N.dim_of(idx=0).data(), dtype=float) / 10.0
+        
+        # Get the raw count data to compute the uncertainty:
+        self.vuv_uncertainty[system] = (
+            self.vuv_signal[system] /
+            scipy.sqrt(t.getNode(system + '.raw:data').data())
+        )
+        
+        print("Processing {system} data...".format(system=system))
+        self.select_vuv(system)
+        
+    def select_vuv(self, system):
+        """Select the lines to use from the given VUV spectrometer.
+        """
+        root = VuvWindow(self, system)
+        root.mainloop()
+
+class XTOMOData(object):
+    """Helper object to load and process the XTOMO data.
+    
+    Execution proceeds as follows:
+    
+    * Loads the XTOMO data from all (core) systems which have data available.
+    * Allows the user to flag bad XTOMO chords and select baseline subtraction
+      windows.
+    * Baseline subtracts, normalizes and combines the data.
+    * Generates a :py:class:`Signal` instance for later use. This is stored in
+      the attribute :py:attr:`signal`.
+    """
+    def __init__(self, shot, injections):
+        self.injections = injections
+        # Fetch the data:
+        tree = MDSplus.Tree('xtomo', shot)
         self.xtomo_sig = {}
         self.xtomo_t = {}
         self.xtomo_channel_mask = {}
@@ -6840,7 +5980,7 @@ class RunData(object):
         # of lists of tuples. The outer list has one entry per injection. Each
         # injection then has one or more 2-tuples with the (start, stop) values
         # of the range(s) to use for baseline subtraction.
-        self.xtomo_baseline_ranges = [[(0, 0.1),],] * len(self.settings.injections)
+        self.xtomo_baseline_ranges = [[(0, 0.1),],] * len(injections)
         for s in (1, 3, 5):
             self.xtomo_sig[s], self.xtomo_t[s] = self.load_xtomo_array(s, tree)
             if self.xtomo_sig[s] is not None:
@@ -6848,14 +5988,80 @@ class RunData(object):
                     self.xtomo_sig[s].shape[0],
                     dtype=bool
                 )
-                self.plot_xtomo(s)
-    
-    def flag_xtomo(self):
-        """Flag the bad XTOMO channels, select baseline subtraction.
-        """
+        
+        # Flag the data:
         root = XtomoWindow(self)
         root.mainloop()
-        print('flag_xtomo done, returning interactive control.')
+        
+        # Process the injections:
+        t = {1: [], 3: [], 5: []}
+        y = {1: [], 3: [], 5: []}
+        std_y = {1: [], 3: [], 5: []}
+        y_norm = {1: [], 3: [], 5: []}
+        std_y_norm = {1: [], 3: [], 5: []}
+        for k, i in enumerate(self.injections):
+            for s in (1, 3, 5):
+                if self.xtomo_sig[s] is not None:
+                    i_start, i_stop = profiletools.get_nearest_idx(
+                        [i.t_start, i.t_stop],
+                        self.xtomo_t[s]
+                    )
+                    
+                    # Apply the baseline subtraction:
+                    bsub_idxs = []
+                    for r in self.xtomo_baseline_ranges[k]:
+                        lb_idx, ub_idx = profiletools.get_nearest_idx(
+                            r,
+                            self.xtomo_t[s]
+                        )
+                        bsub_idxs.extend(range(lb_idx, ub_idx + 1))
+                    # Reduce to just the unique values:
+                    bsub_idxs = list(set(bsub_idxs))
+                    bsub = scipy.mean(self.xtomo_sig[s][:, bsub_idxs], axis=1)
+                    
+                    y[s].append(
+                        self.xtomo_sig[s][self.xtomo_channel_mask[s], i_start:i_stop + 1] -
+                        bsub[self.xtomo_channel_mask[s], None]
+                    )
+                    std_y[s].append(0.1 * y[s][-1])
+                    t[s].append(self.xtomo_t[s][i_start:i_stop + 1] - i.t_inj)
+            
+            for s in (1, 3, 5):
+                if len(y[s]) > 0:
+                    m = y[s][-1].max()
+                    y_norm[s].append(y[s][-1] / m)
+                    std_y_norm[s].append(std_y[s][-1] / m)
+        
+        # Assume all of the time vectors are the same:
+        t_sig = scipy.hstack(t[1])
+        y_sig = []
+        std_y_sig = []
+        y_norm_sig = []
+        std_y_norm_sig = []
+        names = []
+        blocks = []
+        weight_idxs_sig = []
+        for k in (1, 3, 5):
+            if len(t[k]) > 0:
+                y_sig.append(scipy.hstack(y[k]))
+                std_y_sig.append(scipy.hstack(std_y[k]))
+                y_norm_sig.append(scipy.hstack(y_norm[k]))
+                std_y_norm_sig.append(scipy.hstack(std_y_norm[k]))
+                blocks.extend([k,] * y[k][-1].shape[0])
+                names += ['XTOMO %d' % (k,),] * y[k][-1].shape[0]
+                weight_idxs_sig.append(scipy.arange(0, len(self.xtomo_channel_mask[k]))[self.xtomo_channel_mask[k]])
+        
+        self.signal = Signal(
+            scipy.vstack(y_sig).T,
+            scipy.vstack(std_y_sig).T,
+            scipy.vstack(y_norm_sig).T,
+            scipy.vstack(std_y_norm_sig).T,
+            scipy.hstack(t_sig),
+            names,
+            -1,
+            blocks=blocks
+        )
+        self.signal.weight_idxs = scipy.hstack(weight_idxs_sig)
     
     def load_xtomo_array(self, array_num, tree, n_chords=38):
         """Load the data from a given XTOMO array.
@@ -6898,394 +6104,6 @@ class RunData(object):
             sig[n, :len(d)] = d
         
         return sig, t
-    
-    def process_injections(self):
-        """Parcel out the data into the individual injections, normalize and combine.
-        """
-        for k, i in enumerate(self.settings.injections):
-            # First handle the HiReX-SR data:
-            t_hirex_start, t_hirex_stop = profiletools.get_nearest_idx(
-                [i.t_start, i.t_stop],
-                self.hirex_time
-            )
-            i.hirex_signal = self.hirex_signal[t_hirex_start:t_hirex_stop + 1, :]
-            i.hirex_flagged = self.hirex_flagged[t_hirex_start:t_hirex_stop + 1, :]
-            i.hirex_uncertainty = self.hirex_uncertainty[t_hirex_start:t_hirex_stop + 1, :]
-            i.hirex_time = self.hirex_time[t_hirex_start:t_hirex_stop + 1] - i.t_inj
-            
-            if self.settings.debug_plots:
-                i.plot_hirex()
-            
-            # Then handle each of the VUV lines:
-            i.vuv_signals = []
-            i.vuv_uncertainties = []
-            i.vuv_times = []
-            
-            for s in self.vuv_lines.keys():
-                i_start, i_stop = profiletools.get_nearest_idx(
-                    [i.t_start, i.t_stop],
-                    self.vuv_time[s]
-                )
-                for l in self.vuv_lines[s]:
-                    if l.diagnostic_lines is not None:
-                        i.vuv_signals.append(
-                            l.signal[i_start:i_stop + 1]
-                        )
-                        i.vuv_uncertainties.append(
-                            l.uncertainty[i_start:i_stop + 1]
-                        )
-                        i.vuv_times.append(
-                            self.vuv_time[s][i_start:i_stop + 1] - i.t_inj
-                        )
-            
-            i.vuv_signals = scipy.asarray(i.vuv_signals)
-            i.vuv_uncertainties = scipy.asarray(i.vuv_uncertainties)
-            i.vuv_times = scipy.asarray(i.vuv_times)
-            
-            # Then handle the XTOMO systems:
-            i.xtomo_channel_mask = self.xtomo_channel_mask
-            i.xtomo_signal = {}
-            i.xtomo_times = {}
-            for s in (1, 3, 5):
-                if self.xtomo_sig[s] is not None:
-                    i_start, i_stop = profiletools.get_nearest_idx(
-                        [i.t_start, i.t_stop],
-                        self.xtomo_t[s]
-                    )
-                    
-                    # Apply the baseline subtraction:
-                    bsub_idxs = []
-                    for r in self.xtomo_baseline_ranges[k]:
-                        lb_idx, ub_idx = profiletools.get_nearest_idx(
-                            r,
-                            self.xtomo_t[s]
-                        )
-                        bsub_idxs.extend(range(lb_idx, ub_idx + 1))
-                    # Reduce to just the unique values:
-                    bsub_idxs = list(set(bsub_idxs))
-                    bsub = scipy.mean(self.xtomo_sig[s][:, bsub_idxs], axis=1)
-                    
-                    i.xtomo_signal[s] = self.xtomo_sig[s][:, i_start:i_stop + 1] - bsub[:, None]
-                    i.xtomo_times[s] = self.xtomo_t[s][i_start:i_stop + 1] - i.t_inj
-                else:
-                    i.xtomo_signal[s] = None
-                    i.xtomo_times[s] = None
-            
-            i.normalize_data(debug_plots=self.settings.debug_plots)
-        
-        # Combine the injections for HiReX-SR:
-        self.hirex_signal_norm_combined = scipy.vstack(
-            [i.hirex_signal_norm for i in self.settings.injections]
-        )
-        self.hirex_uncertainty_norm_combined = scipy.vstack(
-            [i.hirex_uncertainty_norm for i in self.settings.injections]
-        )
-        self.hirex_flagged_combined = scipy.vstack(
-            [i.hirex_flagged for i in self.settings.injections]
-        )
-        self.hirex_time_combined = scipy.hstack(
-            [i.hirex_time for i in self.settings.injections]
-        )
-        
-        # Combine the injections for VUV:
-        self.vuv_signals_norm_combined = scipy.hstack(
-            [i.vuv_signals_norm for i in self.settings.injections]
-        )
-        self.vuv_uncertainties_norm_combined = scipy.hstack(
-            [i.vuv_uncertainties_norm for i in self.settings.injections]
-        )
-        self.vuv_times_combined = scipy.hstack(
-            [i.vuv_times for i in self.settings.injections]
-        )
-        
-        # Combine the injections for the XTOMO systems:
-        self.xtomo_signal_norm_combined = {}
-        self.xtomo_times_combined = {}
-        for s in (1, 3, 5):
-            if self.xtomo_sig[s] is not None:
-                self.xtomo_signal_norm_combined[s] = scipy.hstack(
-                    [i.xtomo_signal_norm[s] for i in self.settings.injections]
-                )
-                # TODO: Handle uncertainties properly!
-                self.xtomo_times_combined[s] = scipy.hstack(
-                    [i.xtomo_times[s] for i in self.settings.injections]
-                )
-            else:
-                self.xtomo_signal_norm_combined[s] = None
-                self.xtomo_times_combined[s] = None
-        
-        if self.settings.debug_plots:
-            self.plot_hirex(norm=True)
-            self.plot_vuv_normed()
-            for s in (1, 3, 5):
-                if self.xtomo_signal_norm_combined[s] is not None:
-                    self.plot_xtomo(s, norm=True)
-    
-    def plot_data(self, f=None, share_y=False, y_title=0.85, y_label='$b$ [AU]', max_ticks=None, rot_label=False, suptitle='HiReX-SR and VUV'):
-        """Make a big plot with all of the HiReX-SR data and VUV line data.
-        """
-        if f is None:
-            f = plt.figure()
-        
-        ncol = 6
-        nrow = int(
-            scipy.ceil(1.0 * self.hirex_signal_norm_combined.shape[1] / ncol) +
-            scipy.ceil(1.0 * self.vuv_signals_norm_combined.shape[0] / ncol)
-        )
-        gs = mplgs.GridSpec(nrow, ncol)
-        
-        a_H = []
-        i_col = 0
-        i_row = 0
-        for k in xrange(0, self.hirex_signal_norm_combined.shape[1]):
-            a_H.append(
-                f.add_subplot(
-                    gs[i_row, i_col],
-                    sharex=a_H[0] if len(a_H) >= 1 else None,
-                    sharey=a_H[0] if len(a_H) >= 1 and share_y else None
-                )
-            )
-            if i_col > 0 and share_y:
-                plt.setp(a_H[-1].get_yticklabels(), visible=False)
-            else:
-                a_H[-1].set_ylabel(y_label)
-            if i_col < self.vuv_signals_norm_combined.shape[0] or i_row < scipy.ceil(1.0 * self.hirex_signal_norm_combined.shape[1] / ncol) - 2:
-                plt.setp(a_H[-1].get_xticklabels(), visible=False)
-            else:
-                a_H[-1].set_xlabel('$t$ [s]')
-                if rot_label:
-                    plt.setp(a_H[-1].xaxis.get_majorticklabels(), rotation=90)
-                    for tick in a_H[-1].get_yaxis().get_major_ticks():
-                        tick.label1 = tick._get_text1()
-            i_col += 1
-            if i_col >= ncol:
-                i_col = 0
-                i_row += 1
-        
-        a_V = []
-        # Only increment row if it hasn't been done already:
-        if i_col != 0:
-            i_row += 1
-        i_col = 0
-        for k in xrange(0, self.vuv_signals_norm_combined.shape[0]):
-            a_V.append(
-                f.add_subplot(
-                    gs[i_row, i_col],
-                    sharex=a_H[0],
-                    sharey=a_H[0] if share_y else None
-                )
-            )
-            if i_col > 0 and share_y:
-                plt.setp(a_V[-1].get_yticklabels(), visible=False)
-            else:
-                a_V[-1].set_ylabel(y_label)
-            i_col += 1
-            if i_col >= ncol:
-                i_col = 0
-                i_row += 1
-        
-        for k in xrange(0, len(a_H)):
-            a_H[k].set_title('chord %d' % (k,), y=y_title)
-            # a_H[k].set_ylim(bottom=0)
-            good = ~self.hirex_flagged_combined[:, k]
-            a_H[k].errorbar(
-                self.hirex_time_combined[good],
-                self.hirex_signal_norm_combined[good, k],
-                yerr=self.hirex_uncertainty_norm_combined[good, k],
-                fmt='.'
-            )
-            if max_ticks is not None:
-                a_H[k].xaxis.set_major_locator(plt.MaxNLocator(nbins=max_ticks - 1))
-                a_H[k].yaxis.set_major_locator(plt.MaxNLocator(nbins=max_ticks - 1))
-        
-        for k in xrange(0, len(a_V)):
-            a_V[k].set_xlabel('$t$ [s]')
-            if rot_label:
-                plt.setp(a_V[k].xaxis.get_majorticklabels(), rotation=90)
-                for tick in a_V[k].get_yaxis().get_major_ticks():
-                    tick.label1 = tick._get_text1()
-            a_V[k].set_title('line %d' % (k,), y=y_title)
-            # a_V[k].set_ylim(bottom=0)
-            a_V[k].errorbar(
-                self.vuv_times_combined[k, :],
-                self.vuv_signals_norm_combined[k, :],
-                yerr=self.vuv_uncertainties_norm_combined[k, :],
-                fmt='.',
-                color='g'
-            )
-            if max_ticks is not None:
-                a_V[k].xaxis.set_major_locator(plt.MaxNLocator(nbins=max_ticks - 1))
-                a_V[k].yaxis.set_major_locator(plt.MaxNLocator(nbins=max_ticks - 1))
-        
-        if share_y:
-            a_H[0].set_ylim(bottom=0.0)
-            a_H[0].set_xlim(self.hirex_time_combined.min(), self.hirex_time_combined.max())
-        
-        f.suptitle(suptitle)
-        
-        f.canvas.draw()
-        
-        return (f, a_H, a_V)
-
-class Injection(object):
-    """Class to store information on a given injection.
-    """
-    def __init__(self, t_inj, t_start, t_stop):
-        self.t_inj = t_inj
-        self.t_start = t_start
-        self.t_stop = t_stop
-    
-    def normalize_data(self, debug_plots=False):
-        # First handle the HiReX-SR data:
-        # Normalize to the brightest interpolated max on the brightest chord:
-        maxs = scipy.zeros(self.hirex_signal.shape[1])
-        s_maxs = scipy.zeros_like(maxs)
-        
-        for k in xrange(0, self.hirex_signal.shape[1]):
-            good = ~self.hirex_flagged[:, k]
-            maxs[k], s_maxs[k] = interp_max(
-                self.hirex_time[good],
-                self.hirex_signal[good, k],
-                err_y=self.hirex_uncertainty[good, k],
-                debug_plots=debug_plots > 1
-            )
-        
-        i = maxs.argmax()
-        m = maxs[i]
-        s = s_maxs[i]
-        
-        self.hirex_signal_norm = self.hirex_signal / m
-        self.hirex_signal_norm[self.hirex_flagged] = scipy.nan
-        
-        self.hirex_uncertainty_norm = (
-            scipy.absolute(self.hirex_signal_norm) *
-            scipy.sqrt(
-                (self.hirex_uncertainty / self.hirex_signal)**2.0 +
-                (s / m)**2.0
-                # Covariance???
-            )
-        )
-        
-        # Now handle the VUV data:
-        # We don't have a brightness cal for XEUS or LoWEUS, so normalize to
-        # the peak:
-        self.vuv_signals_norm = scipy.nan * scipy.zeros_like(self.vuv_signals)
-        self.vuv_uncertainties_norm = scipy.nan * scipy.zeros_like(self.vuv_uncertainties)
-        
-        for k in xrange(0, self.vuv_signals.shape[0]):
-            m, s = interp_max(
-                self.vuv_times[k, :],
-                self.vuv_signals[k, :],
-                err_y=self.vuv_uncertainties[k, :],
-                debug_plots=debug_plots > 1,
-                s_max=100.0
-            )
-            self.vuv_signals_norm[k, :] = self.vuv_signals[k, :] / m
-            self.vuv_uncertainties_norm[k, :] = (
-                scipy.absolute(self.vuv_signals_norm[k, :]) *
-                scipy.sqrt(
-                    (self.vuv_uncertainties[k, :] / self.vuv_signals[k, :])**2.0 +
-                    (s / m)**2.0
-                    # Covariance???
-                )
-            )
-        
-        # Now handle the XTOMO data:
-        # Trying to do this like I did HiReX-SR runs my system out of memory.
-        # Instead I will just normalize to the highest value, since the time
-        # resolution is so high. But, I need to make sure I throw out the bad
-        # channels!
-        self.xtomo_signal_norm = {}
-        for s in (1, 3, 5):
-            if self.xtomo_signal[s] is not None:
-                self.xtomo_signal_norm[s] = self.xtomo_signal[s] / self.xtomo_signal[s][self.xtomo_channel_mask[s], :].max()
-                # TODO: Handle uncertainty properly!
-            else:
-                self.xtomo_signal_norm[s] = None
-    
-    def plot_hirex(self):
-        """Plot the HiReX-SR data with the interpolation.
-        """
-        f = plt.figure()
-        gs = mplgs.GridSpec(2, 1, height_ratios=[10, 1])
-        l = []
-        
-        a_data = f.add_subplot(gs[0, :])
-        a_slider = f.add_subplot(gs[1, :])
-        a_data.set_xlabel("$t$ [s]")
-        a_data.set_ylabel("HiReX-SR data [AU]")
-        
-        grid = scipy.linspace(self.t_start, self.t_stop, 1000) - self.t_inj
-        
-        def update(dum):
-            remove_all(l)
-            while len(l) > 0:
-                l.pop()
-            
-            i = int(slider.val)
-            
-            good = ~self.hirex_flagged[:, i]
-            
-            l.append(
-                a_data.errorbar(
-                    self.hirex_time[good],
-                    self.hirex_signal[good, i],
-                    yerr=self.hirex_uncertainty[good, i],
-                    color='b',
-                    fmt='.'
-                )
-            )
-            
-            k = gptools.SquaredExponentialKernel(
-                param_bounds=[(0, 10), (0, 2.0)],
-                initial_params=[0.2, 0.03],
-                fixed_params=[False, True]
-            )
-            gp = gptools.GaussianProcess(
-                k,
-                X=self.hirex_time[good],
-                y=self.hirex_signal[good, i],
-                err_y=self.hirex_uncertainty[good, i]
-            )
-            gp.optimize_hyperparameters(verbose=True)
-            m_gp, s_gp = gp.predict(grid)
-            
-            l.append(a_data.plot(grid, m_gp, 'g'))
-            l.append(
-                a_data.fill_between(
-                    grid,
-                    m_gp - s_gp,
-                    m_gp + s_gp,
-                    alpha=0.25,
-                    color='g'
-                )
-            )
-            
-            a_data.relim()
-            a_data.autoscale_view()
-            
-            f.canvas.draw()
-        
-        def arrow_respond(slider, event):
-            if event.key == 'right':
-                slider.set_val(min(slider.val + 1, slider.valmax))
-            elif event.key == 'left':
-                slider.set_val(max(slider.val - 1, slider.valmin))
-        
-        slider = mplw.Slider(
-            a_slider,
-            'channel',
-            0,
-            self.hirex_signal.shape[1] - 1,
-            valinit=0,
-            valfmt='%d'
-        )
-        slider.on_changed(update)
-        update(0)
-        f.canvas.mpl_connect(
-            'key_press_event',
-            lambda evt: arrow_respond(slider, evt)
-        )
 
 def slider_plot(x, y, z, xlabel='', ylabel='', zlabel='', labels=None, **kwargs):
     """Make a plot to explore multidimensional data.
@@ -7367,94 +6185,94 @@ def slider_plot(x, y, z, xlabel='', ylabel='', zlabel='', labels=None, **kwargs)
         lambda evt: arrow_respond(slider, evt)
     )
 
-if _have_PyGMO:
-    class MAPProblem(PyGMO.problem.base):
-        """Problem to be used with PyGMO for global optimization.
-        """
-        def __init__(self, run=None):
-            # This goofy argument nonsense is to deal with how copy.deepcopy works.
-            if run is None:
-                super(MAPProblem, self).__init__(1)
-            else:
-                self.run = run
-                if run.method == 'GP':
-                    ndim = (
-                        run.num_eig_D +
-                        run.num_eig_V +
-                        run.k_D.num_free_params +
-                        run.mu_D.num_free_params +
-                        run.k_V.num_free_params +
-                        ((7 if run.clusters else 5) if run.source_file is None else 2)
-                    )
-                elif run.method == 'spline':
-                    ndim = (
-                        run.num_eig_D +
-                        run.num_eig_V +
-                        (run.num_eig_D - run.spline_k_D if run.free_knots else 0) +
-                        (run.num_eig_V - run.spline_k_V if run.free_knots else 0) +
-                        ((7 if run.clusters else 5) if run.source_file is None else 2)
-                    )
-                elif run.method == 'linterp':
-                    ndim = (
-                        run.num_eig_D +
-                        run.num_eig_V +
-                        (run.num_eig_D - 1 if run.free_knots else 0) +
-                        (run.num_eig_V - 1 if run.free_knots else 0) +
-                        ((7 if run.clusters else 5) if run.source_file is None else 2)
-                    )
-                if run.use_scaling:
-                    ndim += 1 + run.run_data.vuv_signals_norm_combined.shape[0]
-                
-                if run.method in ('spline', 'linterp') and run.free_knots:
-                    if run.method == 'spline':
-                        cdim = (run.num_eig_D - run.spline_k_D - 1) + (run.num_eig_V - run.spline_k_V - 1)
-                    else:
-                        cdim = (run.num_eig_D - 1 - 1) + (run.num_eig_V - 1 - 1)
-                else:
-                    cdim = 0
-                
-                super(MAPProblem, self).__init__(ndim)#, 0, 1, cdim, cdim, 0)
-                
-                bounds = scipy.asarray(self.run.get_prior().bounds[:])
-                
-                self.set_bounds(bounds[:, 0], bounds[:, 1])
-        
-        def _objfun_impl(self, x):
-            acquire_working_dir()
-            try:
-                out = self.run.compute_ln_prob(
-                    x,
-                    sign=-1
-                )
-            except:
-                warnings.warn(
-                    "Unhandled exception. Error is: %s: %s. "
-                    "Params are: %s" % (
-                        sys.exc_info()[0],
-                        sys.exc_info()[1],
-                        x
-                    )
-                )
-                out = scipy.inf
-            finally:
-                release_working_dir()
-            # Some optimizers don't like infinite values, apparently:
-            if scipy.isinf(out):
-                out = sys.float_info.max
-            else:
-                out = float(out)
-            return (out,)
-    
-        # def _compute_constraints_impl(self, x):
-        #     """Compute the constraints on the knots.
-        #
-        #     I assume PyGMO will respect the bounds in any case.
-        #
-        #     I also assume PyGMO will treat a constraint as satisfied if it is >= 0.
-        #     """
-        #     eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.run.split_params(x)
-        #
-        #     return scipy.concatenate((scipy.diff(knots_D), scipy.diff(knots_V)))
+# if _have_PyGMO:
+#     class MAPProblem(PyGMO.problem.base):
+#         """Problem to be used with PyGMO for global optimization.
+#         """
+#         def __init__(self, run=None):
+#             # This goofy argument nonsense is to deal with how copy.deepcopy works.
+#             if run is None:
+#                 super(MAPProblem, self).__init__(1)
+#             else:
+#                 self.run = run
+#                 if run.method == 'GP':
+#                     ndim = (
+#                         run.num_eig_D +
+#                         run.num_eig_V +
+#                         run.k_D.num_free_params +
+#                         run.mu_D.num_free_params +
+#                         run.k_V.num_free_params +
+#                         ((7 if run.clusters else 5) if run.source_file is None else 2)
+#                     )
+#                 elif run.method == 'spline':
+#                     ndim = (
+#                         run.num_eig_D +
+#                         run.num_eig_V +
+#                         (run.num_eig_D - run.spline_k_D if run.free_knots else 0) +
+#                         (run.num_eig_V - run.spline_k_V if run.free_knots else 0) +
+#                         ((7 if run.clusters else 5) if run.source_file is None else 2)
+#                     )
+#                 elif run.method == 'linterp':
+#                     ndim = (
+#                         run.num_eig_D +
+#                         run.num_eig_V +
+#                         (run.num_eig_D - 1 if run.free_knots else 0) +
+#                         (run.num_eig_V - 1 if run.free_knots else 0) +
+#                         ((7 if run.clusters else 5) if run.source_file is None else 2)
+#                     )
+#                 if run.use_scaling:
+#                     ndim += 1 + run.run_data.vuv_signals_norm_combined.shape[0]
+#
+#                 if run.method in ('spline', 'linterp') and run.free_knots:
+#                     if run.method == 'spline':
+#                         cdim = (run.num_eig_D - run.spline_k_D - 1) + (run.num_eig_V - run.spline_k_V - 1)
+#                     else:
+#                         cdim = (run.num_eig_D - 1 - 1) + (run.num_eig_V - 1 - 1)
+#                 else:
+#                     cdim = 0
+#
+#                 super(MAPProblem, self).__init__(ndim)#, 0, 1, cdim, cdim, 0)
+#
+#                 bounds = scipy.asarray(self.run.get_prior().bounds[:])
+#
+#                 self.set_bounds(bounds[:, 0], bounds[:, 1])
+#
+#         def _objfun_impl(self, x):
+#             acquire_working_dir()
+#             try:
+#                 out = self.run.compute_ln_prob(
+#                     x,
+#                     sign=-1
+#                 )
+#             except:
+#                 warnings.warn(
+#                     "Unhandled exception. Error is: %s: %s. "
+#                     "Params are: %s" % (
+#                         sys.exc_info()[0],
+#                         sys.exc_info()[1],
+#                         x
+#                     )
+#                 )
+#                 out = scipy.inf
+#             finally:
+#                 release_working_dir()
+#             # Some optimizers don't like infinite values, apparently:
+#             if scipy.isinf(out):
+#                 out = sys.float_info.max
+#             else:
+#                 out = float(out)
+#             return (out,)
+#
+#         # def _compute_constraints_impl(self, x):
+#         #     """Compute the constraints on the knots.
+#         #
+#         #     I assume PyGMO will respect the bounds in any case.
+#         #
+#         #     I also assume PyGMO will treat a constraint as satisfied if it is >= 0.
+#         #     """
+#         #     eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.run.split_params(x)
+#         #
+#         #     return scipy.concatenate((scipy.diff(knots_D), scipy.diff(knots_V)))
 
 class _ComputeLnProbWrapper(object):
     """Wrapper to support parallel execution of STRAHL runs.
@@ -7643,39 +6461,6 @@ class _CallGPWrapper(object):
         else:
             return self.gp.predict(X, **kwargs)
 
-def send_email(subject, body, impath):
-    """Send an email with the given subject, body and image attachment.
-    
-    Parameters
-    ----------
-    subject : str
-        Subject of the email.
-    body : str
-        Body of the email.
-    impath : str
-        Path to the image to attach to the email.
-    """
-    try:
-        msg = MIMEMultipart()
-        msg['Subject'] = subject
-        msg['From'] = "markchil@mit.edu"
-        msg['To'] = "markchil@mit.edu"
-        msg.attach(MIMEText(body))
-        for im in impath:
-            with open(im, "rb") as f:
-                msg.attach(
-                    MIMEApplication(
-                        f.read(),
-                        Content_Disposition='attachment; filename="%s"' % (os.path.basename(im),)
-                    )
-                )
-        
-        s = smtplib.SMTP("mail1.psfc.mit.edu")
-        s.sendmail("markchil@mit.edu", ["markchil@mit.edu"], msg.as_string())
-        s.quit()
-    except:
-        warnings.warn("Message not sent!")
-
 def eval_profile(x, k, eig, n, params=None, mu=None):
     """Evaluate the profile.
     
@@ -7767,7 +6552,7 @@ def source_function(t, t_start, t_rise, n_rise, t_fall, n_fall, t_cluster=0.0, h
     
     return s
 
-def interp_max(x, y, err_y=None, s_guess=0.2, s_max=10.0, l_guess=0.005, fixed_l=False, debug_plots=False):
+def interp_max(x, y, err_y=None, s_guess=0.2, s_max=10.0, l_guess=0.005, fixed_l=False, debug_plots=False, method='GP'):
     """Compute the maximum value of the smoothed data.
     
     Estimates the uncertainty using Gaussian process regression and returns the
@@ -7793,32 +6578,51 @@ def interp_max(x, y, err_y=None, s_guess=0.2, s_max=10.0, l_guess=0.005, fixed_l
     debug_plots : bool, optional
         Set to True to plot the data, the smoothed curve (with uncertainty) and
         the location of the peak value.
+    method : {'GP', 'spline'}, optional
+        Method to use when interpolating. Default is 'GP' (Gaussian process
+        regression). Can also use a cubic spline.
     """
     grid = scipy.linspace(max(0, x.min()), min(0.08, x.max()), 1000)
-    hp = (
-        gptools.UniformJointPrior([(0, s_max),]) *
-        gptools.GammaJointPriorAlt([l_guess,], [0.1,])
-    )
-    k = gptools.SquaredExponentialKernel(
-        # param_bounds=[(0, s_max), (0, 2.0)],
-        hyperprior=hp,
-        initial_params=[s_guess, l_guess],
-        fixed_params=[False, fixed_l]
-    )
-    gp = gptools.GaussianProcess(k, X=x, y=y, err_y=err_y)
-    gp.optimize_hyperparameters(verbose=True, random_starts=100)
-    m_gp, s_gp = gp.predict(grid)
-    i = m_gp.argmax()
+    if method == 'GP':
+        hp = (
+            gptools.UniformJointPrior([(0, s_max),]) *
+            gptools.GammaJointPriorAlt([l_guess,], [0.1,])
+        )
+        k = gptools.SquaredExponentialKernel(
+            # param_bounds=[(0, s_max), (0, 2.0)],
+            hyperprior=hp,
+            initial_params=[s_guess, l_guess],
+            fixed_params=[False, fixed_l]
+        )
+        gp = gptools.GaussianProcess(k, X=x, y=y, err_y=err_y)
+        gp.optimize_hyperparameters(verbose=True, random_starts=100)
+        m_gp, s_gp = gp.predict(grid)
+        i = m_gp.argmax()
+    elif method == 'spline':
+        m_gp = scipy.interpolate.UnivariateSpline(
+            x, y, w=1.0 / err_y, s=2*len(x)
+        )(grid)
+        if scipy.isnan(m_gp).any():
+            print(x)
+            print(y)
+            print(err_y)
+        i = m_gp.argmax()
+    else:
+        raise ValueError("Undefined method %s" % (method,))
     
     if debug_plots:
         f = plt.figure()
         a = f.add_subplot(1, 1, 1)
         a.errorbar(x, y, yerr=err_y, fmt='.', color='b')
         a.plot(grid, m_gp, color='g')
-        a.fill_between(grid, m_gp - s_gp, m_gp + s_gp, color='g', alpha=0.5)
+        if method == 'GP':
+            a.fill_between(grid, m_gp - s_gp, m_gp + s_gp, color='g', alpha=0.5)
         a.axvline(grid[i])
     
-    return (m_gp[i], s_gp[i])
+    if method == 'GP':
+        return (m_gp[i], s_gp[i])
+    else:
+        return m_gp[i]
 
 # def remove_all(l):
 #     """Remove all of the various hierarchical objects matplotlib spits out.
@@ -8024,16 +6828,16 @@ class HirexWindow(tk.Tk):
         self.plot_frame = HirexPlotFrame(self)
         self.plot_frame.grid(row=0, column=0, sticky='NESW')
         
-        if self.ar:
-            self.signal = data.ar_signal
-            self.time = data.ar_time
-            self.uncertainty = data.ar_uncertainty
-            self.flagged = data.ar_flagged
-        else:
-            self.signal = data.hirex_signal
-            self.time = data.hirex_time
-            self.uncertainty = data.hirex_uncertainty
-            self.flagged = data.hirex_flagged
+        # if self.ar:
+        #     self.signal = data.ar_signal
+        #     self.time = data.ar_time
+        #     self.uncertainty = data.ar_uncertainty
+        #     self.flagged = data.ar_flagged
+        # else:
+        self.signal = data.hirex_signal
+        self.time = data.hirex_time
+        self.uncertainty = data.hirex_uncertainty
+        self.flagged = data.hirex_flagged
         
         self.idx_slider = tk.Scale(
             master=self,
@@ -8784,13 +7588,13 @@ class XtomoPlotFrame(tk.Frame):
             label='baseline-subtracted, smoothed'
         )
         self.l_inj_time = self.a.axvline(
-            self.master.data.settings.injections[0].t_inj,
+            self.master.data.injections[0].t_inj,
             color='r',
             label='injection time'
         )
         self.span_inj_window = self.a.axvspan(
-            self.master.data.settings.injections[0].t_start,
-            self.master.data.settings.injections[0].t_stop,
+            self.master.data.injections[0].t_start,
+            self.master.data.injections[0].t_stop,
             color='r',
             alpha=0.2
         )
@@ -8869,7 +7673,7 @@ class XtomoWindow(tk.Tk):
         self.inj_state = tk.StringVar(self)
         self.inj_state.set("0")
         
-        self.inj_s = [str(v) for v in range(0, len(self.data.settings.injections))]
+        self.inj_s = [str(v) for v in range(0, len(self.data.injections))]
         self.inj_menu = tk.OptionMenu(
             self,
             self.inj_state,
@@ -9069,11 +7873,11 @@ class XtomoWindow(tk.Tk):
         
         if plot_inj_time:
             self.plot_frame.l_inj_time.set_xdata(
-                [self.data.settings.injections[int(self.inj_state.get())].t_inj,] * 2
+                [self.data.injections[int(self.inj_state.get())].t_inj,] * 2
             )
             xy = self.plot_frame.span_inj_window.get_xy()
-            xy[[0, 1, 4], 0] = self.data.settings.injections[int(self.inj_state.get())].t_start
-            xy[[2, 3], 0] = self.data.settings.injections[int(self.inj_state.get())].t_stop
+            xy[[0, 1, 4], 0] = self.data.injections[int(self.inj_state.get())].t_start
+            xy[[2, 3], 0] = self.data.injections[int(self.inj_state.get())].t_stop
             self.plot_frame.span_inj_window.set_xy(xy)
         
         if plot_bsub or plot_inj_time:
@@ -9329,6 +8133,7 @@ class HirexVuvFrame(tk.Frame):
         self.canvas.show()
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky='NESW')
         
+        # TODO: Update this!
         dum, self.a_H, self.a_V = self.master.r.run_data.plot_data(f=self.f)
         
         # Make dummy lines to modify data in:
