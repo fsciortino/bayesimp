@@ -475,6 +475,27 @@ class Run(object):
         If provided, these are used to construct synthetic data (using the
         equilibrium and temperature/density profiles from the specified shot).
         Default is to use actual experimental data.
+    synth_li_lines : array of int, optional
+        The indices of the Li-like Ca lines to use when constructing the
+        synthetic data. The default is to use the ones normally seen on XEUS.
+    synth_be_lines : array of int, optional
+        The indices of the Be-like Ca lines to use when constructing the
+        synthetic data. The default is to use the one normally seen on LoWEUS.
+    hirex_time_res : float, optional
+        The time resolution (in seconds) to use for synthetic HiReX-SR data.
+        Default is 1e-3.
+    vuv_time_res : float, optional
+        The time resolution (in seconds) to use for synthetic VUV data. Default
+        is 1e-3.
+    xtomo_time_res : float, optional
+        The time resolution (in seconds) to use for the synthetic XTOMO data.
+        Default is 2e-6.
+    presampling_time : float, optional
+        The time (in seconds) to keep from before `time_1` when generating
+        synthetic data. Default is 15e-3.
+    synth_noises : array of float, optional
+        The relative noise levels to use with the synthetic data. Default is
+        [0.03, 0.03, 0.1].
     normalize : bool, optional
         If True, normalized signals will be used when comparing to STRAHL output.
         Default is True.
@@ -514,14 +535,17 @@ class Run(object):
             use_scaling=False,
             sort_knots=False,
             params_true=None,
+            synth_li_lines=[0, 3, 5, 2, 12, 8, 6],
+            synth_be_lines=[0,],
+            hirex_time_res=1e-3,
+            vuv_time_res=1e-3,
+            xtomo_time_res=2e-6,
+            presampling_time=15e-3,
+            synth_noises=[0.03, 0.03, 0.1],
             normalize=True
         ):
         
         global MASTER_DIR
-        
-        # TODO: Add some command line flags to override/redo as needed.
-        # TODO: Make it recognize when the settings have changed and update the
-        # the right portions accordingly!
         
         self._ll_normalization = None
         self._ar_ll_normalization = None
@@ -614,23 +638,8 @@ class Run(object):
             if source_file is not None:
                 # Offsets for HiReX, XEUS/LoWEUS and XTOMO.
                 source_prior = gptools.NormalJointPrior([0, 0, 0], [2e-3, 2e-3, 2e-3])
-            # TODO: This code is stale and needs to be updated!
-            elif clusters:
-                source_prior = (
-                    gptools.UniformJointPrior([(-2e-3, 2e-3)]) *
-                    gptools.GammaJointPrior(
-                        [1.0] * 6,
-                        [0.1e-3, 1, 1.0e-3, 3, 20e-3, 1e-3]
-                    )
-                )
-            else:  # no source_file, no clusters:
-                source_prior = (
-                    gptools.UniformJointPrior([(-2e-3, 2e-3)]) *
-                    gptools.GammaJointPrior(
-                        [1.0] * 4,
-                        [0.1e-3, 1, 1.0e-3, 3]
-                    )
-                )
+            else:
+                raise NotImplementedError("Explicit source file must be provided!")
         self.source_prior = source_prior
         
         # If a STRAHL directory doesn't exist yet, create one and set it up:
@@ -658,36 +667,6 @@ class Run(object):
             with open('run_data.pkl', 'wb') as f:
                 pkl.dump(self.run_data, f, protocol=pkl.HIGHEST_PROTOCOL)
         
-        print("Loading signals...")
-        try:
-            with open('signals.pkl', 'rb') as f:
-                self.signals = pkl.load(f)
-            with open('ar_signal.pkl', 'rb') as f:
-                self.ar_signal = pkl.load(f)
-            print("Loaded signals from signals.pkl.")
-        except IOError:
-            self.signals = []
-            hirex_data = HirexData(self.injections, debug_plots=self.debug_plots)
-            self.signals.append(hirex_data.signal)
-            vuv_data = VUVData(self.shot, self.injections, debug_plots=self.debug_plots)
-            self.signals.append(vuv_data.signal)
-            xtomo_data = XTOMOData(self.shot, self.injections)
-            self.signals.append(xtomo_data.signal)
-            
-            ar_data = HirexData(self.injections, ar=True, debug_plots=self.debug_plots)
-            self.ar_signal = ar_data.signal
-            
-            # Compute the view data and store it directly in the Signal objects:
-            self.compute_view_data()
-            
-            with open('signals.pkl', 'wb') as f:
-                pkl.dump(self.signals, f, protocol=pkl.HIGHEST_PROTOCOL)
-            with open('ar_signal.pkl', 'wb') as f:
-                pkl.dump(self.ar_signal, f, protocol=pkl.HIGHEST_PROTOCOL)
-            
-            # Write the atomdat file:
-            self.write_atomdat(vuv_data)
-        
         self._PEC = None
         self.load_PEC()
         
@@ -701,6 +680,215 @@ class Run(object):
         self.sindat = lines.read_sindat()
         with open('Be_50_um_PEC.pkl', 'rb') as f:
             self.filter_trans = pkl.load(f)
+        
+        if not os.path.isfile('nete/Caflx%d.dat' % (self.shot,)):
+            print("Fetching source data...")
+            shutil.copyfile(
+                self.source_file,
+                'nete/Caflx%d.dat' % (self.shot,)
+            )
+        
+        print("Loading signals...")
+        try:
+            with open('signals.pkl', 'rb') as f:
+                self.signals = pkl.load(f)
+            with open('ar_signal.pkl', 'rb') as f:
+                self.ar_signal = pkl.load(f)
+            if os.path.isfile('truth_data.pkl'):
+                with open('truth_data.pkl', 'rb') as f:
+                    self.truth_data = pkl.load(f)
+            print("Loaded signals from signals.pkl.")
+        except IOError:
+            if self.params_true is None:
+                self.signals = []
+                hirex_data = HirexData(self.injections, debug_plots=self.debug_plots)
+                self.signals.append(hirex_data.signal)
+                vuv_data = VUVData(self.shot, self.injections, debug_plots=self.debug_plots)
+                self.signals.append(vuv_data.signal)
+                xtomo_data = XTOMOData(self.shot, self.injections)
+                self.signals.append(xtomo_data.signal)
+                
+                ar_data = HirexData(self.injections, ar=True, debug_plots=self.debug_plots)
+                self.ar_signal = ar_data.signal
+                
+                # Write the atomdat file:
+                self.write_atomdat(vuv_data)
+                # Read it back in to ensure consistency:
+                self.atomdat = read_atomdat('Ca.atomdat')
+                
+                self.compute_view_data()
+            else:
+                # Generate the synthetic data:
+                
+                # Write the atomdat file:
+                self.write_atomdat(None, li_like=synth_li_lines, be_like=synth_be_lines)
+                # Read it back in to ensure consistency:
+                self.atomdat = read_atomdat('Ca.atomdat')
+                
+                # Load the HiReX-SR POS vectors:
+                data = scipy.io.readsav('run_data.sav')
+                ar_pos = scipy.asarray(data.ar_data.pos[0], dtype=float)
+                hirex_pos = scipy.asarray(data.hirex_data.pos[0], dtype=float)
+                
+                # Make placeholders for the signals:
+                self.signals = []
+                
+                # HiReX-SR:
+                npts = int(scipy.ceil((self.time_2 - self.time_1 + presampling_time) / hirex_time_res))
+                t = scipy.linspace(-presampling_time, -presampling_time + hirex_time_res * (npts - 1), npts)
+                self.signals.append(
+                    Signal(
+                        scipy.zeros((len(t), hirex_pos.shape[0])),
+                        scipy.zeros((len(t), hirex_pos.shape[0])),
+                        scipy.zeros((len(t), hirex_pos.shape[0])),
+                        scipy.zeros((len(t), hirex_pos.shape[0])),
+                        t,
+                        'HiReX-SR',
+                        0,
+                        pos=hirex_pos
+                    )
+                )
+                
+                # HiReX-SR argon:
+                self.ar_signal = Signal(
+                    scipy.zeros((len(t), ar_pos.shape[0])),
+                    scipy.zeros((len(t), ar_pos.shape[0])),
+                    scipy.zeros((len(t), ar_pos.shape[0])),
+                    scipy.zeros((len(t), ar_pos.shape[0])),
+                    t,
+                    'HiReX-SR (Ar)',
+                    0,
+                    pos=ar_pos
+                )
+                
+                # VUV:
+                npts = int(scipy.ceil((self.time_2 - self.time_1 + presampling_time) / vuv_time_res))
+                t = scipy.linspace(-presampling_time, -presampling_time + vuv_time_res * (npts - 1), npts)
+                self.signals.append(
+                    Signal(
+                        scipy.zeros((len(t), len(synth_li_lines) + len(synth_be_lines))),
+                        scipy.zeros((len(t), len(synth_li_lines) + len(synth_be_lines))),
+                        scipy.zeros((len(t), len(synth_li_lines) + len(synth_be_lines))),
+                        scipy.zeros((len(t), len(synth_li_lines) + len(synth_be_lines))),
+                        t,
+                        ['XEUS',] * len(synth_li_lines) + ['LoWEUS',] * len(synth_be_lines),
+                        range(1, len(synth_li_lines) + len(synth_be_lines) + 1),
+                        pos=scipy.vstack([XEUS_POS,] * len(synth_li_lines) + [LOWEUS_POS,] * len(synth_be_lines)),
+                        blocks=range(0, len(synth_li_lines) + len(synth_be_lines))
+                    )
+                )
+                
+                # XTOMO:
+                npts = int(scipy.ceil((self.time_2 - self.time_1 + presampling_time) / xtomo_time_res))
+                t = scipy.linspace(-presampling_time, -presampling_time + xtomo_time_res * (npts - 1), npts)
+                self.signals.append(
+                    Signal(
+                        scipy.zeros((len(t), 38 * 2)),
+                        scipy.zeros((len(t), 38 * 2)),
+                        scipy.zeros((len(t), 38 * 2)),
+                        scipy.zeros((len(t), 38 * 2)),
+                        t,
+                        ['XTOMO 1',] * 38 + ['XTOMO 3',] * 38,
+                        -1,
+                        blocks=[1,] * 38 + [3,] * 38
+                    )
+                )
+                self.signals[-1].weight_idxs = scipy.hstack((range(0, 38), range(0, 38)))
+                
+                # Compute the view data:
+                self.compute_view_data()
+                
+                # Temporarily override normalization so we can get the absolute
+                # and relative signals:
+                # First, absolute:
+                self.normalize = False
+                
+                # First for (time-dependent) CaF2:
+                cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(self.params_true, debug_plots=debug_plots)
+                dlines = self.cs_den2dlines(self.params_true, cs_den, sqrtpsinorm, time, ne, Te, debug_plots=debug_plots)
+                sig_abs = self.dlines2sig(self.params_true, dlines, time, debug_plots=debug_plots)
+                for s, ss in zip(sig_abs, self.signals):
+                    ss.y = s
+                
+                # Now for Ar:
+                cs_den_ar, sqrtpsinorm, time_ar, ne, Te = self.DV2cs_den(self.params_true, debug_plots=debug_plots, steady_ar=1e15)
+                dlines_ar = self.cs_den2dlines(self.params_true, cs_den_ar, sqrtpsinorm, time_ar, ne, Te, debug_plots=debug_plots, steady_ar=1e15)
+                sig_abs_ar = self.dlines2sig(self.params_true, dlines_ar, time_ar, debug_plots=debug_plots, steady_ar=1e15)
+                self.ar_signal.y[:, :] = sig_abs_ar
+                
+                # Now, normalized:
+                self.normalize = True
+                
+                # First for (time-dependent) CaF2:
+                sig_norm = self.dlines2sig(self.params_true, dlines, time, debug_plots=debug_plots)
+                for s, ss in zip(sig_norm, self.signals):
+                    ss.y_norm = s
+                
+                # Now for Ar:
+                sig_norm_ar = self.dlines2sig(self.params_true, dlines_ar, time_ar, debug_plots=debug_plots, steady_ar=1e15)
+                self.ar_signal.y_norm[:, :] = sig_norm_ar
+                
+                # Now set it back:
+                self.normalize = normalize
+                
+                # Write a file with the truth values:
+                self.truth_data = TruthData(
+                    params_true,
+                    cs_den,
+                    dlines,
+                    sig_abs,
+                    sig_norm,
+                    time,
+                    sqrtpsinorm,
+                    cs_den_ar,
+                    dlines_ar,
+                    sig_abs_ar,
+                    sig_norm_ar,
+                    time_ar
+                )
+                with open('truth_data.pkl', 'wb') as f:
+                    pkl.dump(self.truth_data, f, protocol=pkl.HIGHEST_PROTOCOL)
+                
+                # Apply noise:
+                self.apply_noise(noises=synth_noises)
+            
+            with open('signals.pkl', 'wb') as f:
+                pkl.dump(self.signals, f, protocol=pkl.HIGHEST_PROTOCOL)
+            with open('ar_signal.pkl', 'wb') as f:
+                pkl.dump(self.ar_signal, f, protocol=pkl.HIGHEST_PROTOCOL)
+        
+        # Sort the time axes:
+        for s in self.signals:
+            s.sort_t()
+        self.ar_signal.sort_t()
+    
+    def apply_noise(self, noises=[0.03, 0.03, 0.1]):
+        """Apply random noise to the data.
+        
+        Parameters
+        ----------
+        noises : array of float, optional
+            The relative noise level to apply to each signal in
+            :py:attr:`self.signals`. The first element is also used for the
+            argon data. Default is [0.03, 0.03, 0.1].
+        """
+        for i, (n, s) in enumerate(zip(noises, self.signals)):
+            s.y = self.truth_data.sig_abs[i] * (1.0 + n * scipy.randn(*self.truth_data.sig_abs[i].shape))
+            s.std_y = n * self.truth_data.sig_abs[i]
+            s.std_y[s.std_y == 0] = n * self.truth_data.sig_abs[i][self.truth_data.sig_abs[i] > 0.0].min()
+            
+            s.y_norm = self.truth_data.sig_norm[i] * (1.0 + n * scipy.randn(*self.truth_data.sig_norm[i].shape))
+            s.std_y_norm = n * self.truth_data.sig_norm[i]
+            s.std_y_norm[s.std_y_norm == 0] = n * self.truth_data.sig_norm[i][self.truth_data.sig_norm[i] > 0.0].min()
+        
+        # Needs special handling since sig_*_ar just has a single timepoint:
+        self.ar_signal.y[:, :] = self.truth_data.sig_abs_ar * (1.0 + noises[0] * scipy.randn(*self.ar_signal.y.shape))
+        self.ar_signal.std_y[:, :] = noises[0] * self.truth_data.sig_abs_ar
+        self.ar_signal.std_y[self.ar_signal.std_y == 0] = noises[0] * self.truth_data.sig_abs_ar[self.truth_data.sig_abs_ar[i] > 0.0].min()
+        
+        self.ar_signal.y_norm[:, :] = self.truth_data.sig_norm_ar * (1.0 + noises[0] * scipy.randn(*self.ar_signal.y.shape))
+        self.ar_signal.std_y_norm[:, :] = noises[0] * self.truth_data.sig_norm_ar
+        self.ar_signal.std_y_norm[self.ar_signal.std_y_norm == 0] = noises[0] * self.truth_data.sig_norm_ar[self.truth_data.sig_norm_ar[i] > 0.0].min()
     
     def eval_DV(self, params, plot=False, lc=None, label=None):
         """Evaluate the D, V profiles for the given parameters.
@@ -1466,7 +1654,7 @@ class Run(object):
         if debug_plots:
             if steady_ar is None:
                 for i, s in enumerate(self.signals):
-                    f, a = s.plot_data(norm=self.normalize)
+                    f, a = s.plot_data(norm=self.normalize, fast=(i == 2))
                     srt = s.t.argsort()
                     for k, ax in enumerate(a):
                         ax.plot(s.t[srt], sig[i][srt, k])
@@ -1662,16 +1850,6 @@ class Run(object):
             Te,
             steady_ar=None,
             debug_plots=False,
-            big_f=None,
-            a_H=None,
-            a_V=None,
-            f_xtomo=None,
-            a_xtomo=None,
-            ar_f=None,
-            ar_a=None,
-            label='_nolegend_',
-            lc='g',
-            alpha=1.0
         ):
         """Computes the diagnostic signals corresponding to the given charge state densities.
         
@@ -1694,16 +1872,6 @@ class Run(object):
             time,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
-            big_f=big_f,
-            a_H=a_H,
-            a_V=a_V,
-            f_xtomo=f_xtomo,
-            a_xtomo=a_xtomo,
-            ar_f=ar_f,
-            ar_a=ar_a,
-            label=label,
-            lc=lc,
-            alpha=alpha
         )
     
     def dlines2diffs(
@@ -1713,16 +1881,6 @@ class Run(object):
             time,
             steady_ar=None,
             debug_plots=False,
-            big_f=None,
-            a_H=None,
-            a_V=None,
-            f_xtomo=None,
-            a_xtomo=None,
-            ar_f=None,
-            ar_a=None,
-            label='_nolegend_',
-            lc='g',
-            alpha=1.0
         ):
         """Computes the diagnostic differences corresponding to the given local emissivities.
         
@@ -1735,16 +1893,6 @@ class Run(object):
             time,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
-            big_f=big_f,
-            a_H=a_H,
-            a_V=a_V,
-            f_xtomo=f_xtomo,
-            a_xtomo=a_xtomo,
-            ar_f=ar_f,
-            ar_a=ar_a,
-            label=label,
-            lc=lc,
-            alpha=alpha
         )
         return self.sig2diffs(
             params,
@@ -1793,16 +1941,6 @@ class Run(object):
             no_write=False,
             no_strahl=False,
             compute_view_data=False,
-            big_f=None,
-            a_H=None,
-            a_V=None,
-            f_xtomo=None,
-            a_xtomo=None,
-            ar_f=None,
-            ar_a=None,
-            label='_nolegend_',
-            lc='g',
-            alpha=1.0
         ):
         """Predicts the diagnostic signals that would arise from the given parameters.
         
@@ -1845,16 +1983,6 @@ class Run(object):
             time,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
-            big_f=big_f,
-            a_H=a_H,
-            a_V=a_V,
-            f_xtomo=f_xtomo,
-            a_xtomo=a_xtomo,
-            ar_f=ar_f,
-            ar_a=ar_a,
-            label=label,
-            lc=lc,
-            alpha=alpha
         )
     
     def cs_den2diffs(
@@ -1867,16 +1995,6 @@ class Run(object):
             Te,
             steady_ar=None,
             debug_plots=False,
-            big_f=None,
-            a_H=None,
-            a_V=None,
-            f_xtomo=None,
-            a_xtomo=None,
-            ar_f=None,
-            ar_a=None,
-            label='_nolegend_',
-            lc='g',
-            alpha=1.0
         ):
         """Computes the diagnostic differences corresponding to the given charge state densities.
         
@@ -1900,16 +2018,6 @@ class Run(object):
             time,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
-            big_f=big_f,
-            a_H=a_H,
-            a_V=a_V,
-            f_xtomo=f_xtomo,
-            a_xtomo=a_xtomo,
-            ar_f=ar_f,
-            ar_a=ar_a,
-            label=label,
-            lc=lc,
-            alpha=alpha
         )
         return self.sig2diffs(
             params,
@@ -1925,16 +2033,6 @@ class Run(object):
             time,
             steady_ar=None,
             debug_plots=False,
-            big_f=None,
-            a_H=None,
-            a_V=None,
-            f_xtomo=None,
-            a_xtomo=None,
-            ar_f=None,
-            ar_a=None,
-            label='_nolegend_',
-            lc='g',
-            alpha=1.0,
             d_weights=[1.0, 1.0, 1.0],
             sign=1.0
         ):
@@ -1950,16 +2048,6 @@ class Run(object):
             time,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
-            big_f=big_f,
-            a_H=a_H,
-            a_V=a_V,
-            f_xtomo=f_xtomo,
-            a_xtomo=a_xtomo,
-            ar_f=ar_f,
-            ar_a=ar_a,
-            label=label,
-            lc=lc,
-            alpha=alpha
         )
         sig_diff = self.sig2diffs(
             params,
@@ -1987,16 +2075,6 @@ class Run(object):
             no_write=False,
             no_strahl=False,
             compute_view_data=False,
-            big_f=None,
-            a_H=None,
-            a_V=None,
-            f_xtomo=None,
-            a_xtomo=None,
-            ar_f=None,
-            ar_a=None,
-            label='_nolegend_',
-            lc='g',
-            alpha=1.0
         ):
         """Computes the diagnostic differences corresponding to the given parameters.
         
@@ -2039,16 +2117,6 @@ class Run(object):
             time,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
-            big_f=big_f,
-            a_H=a_H,
-            a_V=a_V,
-            f_xtomo=f_xtomo,
-            a_xtomo=a_xtomo,
-            ar_f=ar_f,
-            ar_a=ar_a,
-            label=label,
-            lc=lc,
-            alpha=alpha
         )
         return self.sig2diffs(
             params,
@@ -2067,16 +2135,6 @@ class Run(object):
             Te,
             steady_ar=None,
             debug_plots=False,
-            big_f=None,
-            a_H=None,
-            a_V=None,
-            f_xtomo=None,
-            a_xtomo=None,
-            ar_f=None,
-            ar_a=None,
-            label='_nolegend_',
-            lc='g',
-            alpha=1.0,
             d_weights=[1.0, 1.0, 1.0],
             sign=1.0
         ):
@@ -2102,16 +2160,6 @@ class Run(object):
             time,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
-            big_f=big_f,
-            a_H=a_H,
-            a_V=a_V,
-            f_xtomo=f_xtomo,
-            a_xtomo=a_xtomo,
-            ar_f=ar_f,
-            ar_a=ar_a,
-            label=label,
-            lc=lc,
-            alpha=alpha
         )
         sig_diff = self.sig2diffs(
             params,
@@ -2236,16 +2284,6 @@ class Run(object):
             no_write=False,
             no_strahl=False,
             compute_view_data=False,
-            big_f=None,
-            a_H=None,
-            a_V=None,
-            f_xtomo=None,
-            a_xtomo=None,
-            ar_f=None,
-            ar_a=None,
-            label='_nolegend_',
-            lc='g',
-            alpha=1.0,
             d_weights=[1.0, 1.0, 1.0],
             use_local=False,
             cs_mask=None
@@ -2303,16 +2341,6 @@ class Run(object):
                 time,
                 steady_ar=steady_ar,
                 debug_plots=debug_plots,
-                big_f=big_f,
-                a_H=a_H,
-                a_V=a_V,
-                f_xtomo=f_xtomo,
-                a_xtomo=a_xtomo,
-                ar_f=ar_f,
-                ar_a=ar_a,
-                label=label,
-                lc=lc,
-                alpha=alpha
             )
             sig_diff = self.sig2diffs(
                 params,
@@ -2888,8 +2916,7 @@ class Run(object):
     def make_MAP_slider_plot(
             self, params, lp, status, D, V, D_true, V_true,
             dlines_true=None, dlines=None, sqrtpsinorm=None, time=None,
-            sbright_true=None, vbright_true=None, xtomobright_true=None,
-            sbright=None, vbright=None, xtomobright=None
+            sig_true=None, sig=None
         ):
         """Make a plot which lets you explore the output of :py:meth:`process_MAP_from_SQL`.
         
@@ -3016,11 +3043,7 @@ class Run(object):
                 else:
                     a_lines_norm[-1].set_title("SXR")
             
-            gs_sig = mplgs.GridSpecFromSubplotSpec(
-                2 + len(xtomobright),
-                1,
-                outer_grid[0, 2]
-            )
+            gs_sig = mplgs.GridSpecFromSubplotSpec(3, 1, outer_grid[0, 2])
             
             a_sr = f.add_subplot(gs_sig[0, 0])
             a_sr.set_title("HiReX-SR")
@@ -3031,13 +3054,11 @@ class Run(object):
             a_vuv.set_ylabel("normalized signal [AU]")
             a_vuv.set_ylim(bottom=0)
             a_vuv.set_xlim(-0.5, 2.5)
-            a_xtomo = []
-            for i, k in enumerate(xtomobright.iterkeys()):
-                a_xtomo.append(f.add_subplot(gs_sig[2 + i, 0]))
-                a_xtomo[-1].set_title("XTOMO %d" % (k,))
-                a_xtomo[-1].set_ylabel("normalized signal [AU]")
-                a_xtomo[-1].set_ylim(bottom=0)
-            a_xtomo[-1].set_xlabel("chord")
+            a_xtomo = f.add_subplot(gs_sig[2, 0])
+            a_xtomo.set_title("XTOMO (combined)")
+            a_xtomo.set_ylabel("normalized signal [AU]")
+            a_xtomo.set_ylim(bottom=0)
+            a_xtomo.set_xlabel("chord")
         
         plt.setp(a_D.get_xticklabels(), visible=False)
         a_V.set_xlabel(r"$r/a$")
@@ -3075,16 +3096,16 @@ class Run(object):
             
             # Plot the line integrals:
             lines_sig_sr = a_sr.plot(
-                range(sbright.shape[-1]),
-                sbright[:, 0, :].T,
+                range(sig[0].shape[-1]),
+                sig[0][:, 0, :].T,
                 color='k',
                 alpha=off_alpha,
                 ls='None',
                 marker='o'
             )
             line_sig_sr_true, = a_sr.plot(
-                range(sbright.shape[-1]),
-                sbright_true[0, :],
+                range(sig[0].shape[-1]),
+                sig_true[0][0, :],
                 color='g',
                 zorder=len(lp) + 1,
                 ls='None',
@@ -3092,16 +3113,16 @@ class Run(object):
             )
             
             lines_sig_vuv = a_vuv.plot(
-                range(vbright.shape[-1]),
-                vbright[:, 0, :].T,
+                range(sig[1].shape[-1]),
+                sig[1][:, 0, :].T,
                 color='k',
                 alpha=off_alpha,
                 ls='None',
                 marker='o'
             )
             line_sig_vuv_true, = a_vuv.plot(
-                range(vbright.shape[-1]),
-                vbright_true[0, :],
+                range(sig[1].shape[-1]),
+                sig_true[1][0, :],
                 color='g',
                 zorder=len(lp) + 1,
                 ls='None',
@@ -3109,12 +3130,13 @@ class Run(object):
             )
             
             # Plot the actual data:
-            # TODO: This needs to be updated!
-            t_idx_sr = profiletools.get_nearest_idx(time[0] - self.time_1, self.run_data.hirex_time_combined)
+            t_idx_sr = profiletools.get_nearest_idx(time[0] - self.time_1, self.signals[0].t)
+            y = self.signals[0].y_norm if self.normalize else self.signals[0].y
+            err_y = self.signals[0].std_y_norm if self.normalize else self.signals[0].std_y
             line_data_sr, (erry_top_data_sr, erry_bot_data_sr), (barsy_data_sr,) = a_sr.errorbar(
-                range(sbright.shape[-1]),
-                self.run_data.hirex_signal_norm_combined[t_idx_sr, :],
-                yerr=self.run_data.hirex_uncertainty_norm_combined[t_idx_sr, :],
+                range(sig[0].shape[-1]),
+                y[t_idx_sr, :],
+                yerr=err_y[t_idx_sr, :],
                 color='r',
                 ls='None',
                 marker='^',
@@ -3122,53 +3144,49 @@ class Run(object):
             )
             
             # Assume all VUV diagnostics have the same timebase:
-            t_idx_vuv = profiletools.get_nearest_idx(time[0] - self.time_1, self.run_data.vuv_times_combined[0, :])
+            t_idx_vuv = profiletools.get_nearest_idx(time[0] - self.time_1, self.signals[1].t)
+            y = self.signals[1].y_norm if self.normalize else self.signals[1].y
+            err_y = self.signals[1].std_y_norm if self.normalize else self.signals[1].std_y
             line_data_vuv, (erry_top_data_vuv, erry_bot_data_vuv), (barsy_data_vuv,) = a_vuv.errorbar(
-                range(vbright.shape[-1]),
-                self.run_data.vuv_signals_norm_combined[:, t_idx_vuv],
-                yerr=self.run_data.vuv_uncertainties_norm_combined[:, t_idx_vuv],
+                range(sig[1].shape[-1]),
+                self.signals[1].y,
+                y[t_idx_vuv, :],
+                yerr=err_y[t_idx_vuv, :],
                 color='r',
                 ls='None',
                 marker='^',
                 zorder=len(lp) + 2
             )
             
-            line_data_xtomo = {}
-            erry_top_data_xtomo = {}
-            erry_bot_data_xtomo = {}
-            barsy_data_xtomo = {}
+            t_idx_xtomo = profiletools.get_nearest_idx(time[0] - self.time_1, self.signals[2].t)
+            y = self.signals[2].y_norm if self.normalize else self.signals[2].y
+            err_y = self.signals[2].std_y_norm if self.normalize else self.signals[2].std_y
+            line_data_xtomo, (erry_top_data_xtomo, erry_bot_data_xtomo), (barsy_data_xtomo,) = a_xtomo.errorbar(
+                range(sig[2].shape[-1]),
+                y[t_idx_xtomo, :],
+                yerr=err_y[t_idx_xtomo, :],
+                color='r',
+                ls='None',
+                marker='^',
+                zorder=len(lp) + 2
+            )
             
-            for i, (k, s) in enumerate(self.run_data.xtomo_signal_norm_combined.iteritems()):
-                t_idx_xtomo = profiletools.get_nearest_idx(time[0] - self.time_1, self.run_data.xtomo_times_combined[k])
-                line_data_xtomo[k], (erry_top_data_xtomo[k], erry_bot_data_xtomo[k]), (barsy_data_xtomo[k],) = a_xtomo[i].errorbar(
-                    range(xtomobright[k].shape[-1]),
-                    s[:, t_idx_xtomo],
-                    yerr=0.1 * s[:, t_idx_xtomo],
-                    color='r',
-                    ls='None',
-                    marker='^',
-                    zorder=len(lp) + 2
-                )
-            
-            lines_xtomo = {}
-            lines_xtomo_true = {}
-            for k, a in zip(xtomobright.iterkeys(), a_xtomo):
-                lines_xtomo[k] = a.plot(
-                    range(xtomobright[k].shape[-1]),
-                    xtomobright[k][:, 0, :].T,
-                    color='k',
-                    alpha=off_alpha,
-                    ls='None',
-                    marker='o'
-                )
-                lines_xtomo_true[k], = a.plot(
-                    range(xtomobright[k].shape[-1]),
-                    xtomobright_true[k][0, :],
-                    color='g',
-                    zorder=len(lp) + 1,
-                    ls='None',
-                    marker='s'
-                )
+            lines_xtomo = a_xtomo.plot(
+                range(sig[2].shape[-1]),
+                sig[2][:, 0, :].T,
+                color='k',
+                alpha=off_alpha,
+                ls='None',
+                marker='o'
+            )
+            lines_xtomo_true, = a_xtomo.plot(
+                range(sig[2].shape[-1]),
+                sig_true[2][0, :],
+                color='g',
+                zorder=len(lp) + 1,
+                ls='None',
+                marker='s'
+            )
         
         sl = mplw.Slider(a_s, 'case index', 0, len(status) - 1, valinit=0, valfmt='%d')
         
@@ -3189,7 +3207,7 @@ class Run(object):
             lines_D[update_samp.old_idx].set_zorder(2)
             lines_V[update_samp.old_idx].set_zorder(2)
             if dlines is not None:
-                for i, lines in enumerate(lines_dlines + [lines_sig_sr, lines_sig_vuv] + lines_xtomo.values() + lines_dlines_norm):
+                for i, lines in enumerate(lines_dlines + [lines_sig_sr, lines_sig_vuv, lines_xtomo] + lines_dlines_norm):
                     lines[update_samp.old_idx].set_alpha(off_alpha)
                     lines[update_samp.old_idx].set_color('k')
                     lines[update_samp.old_idx].set_linewidth(1)
@@ -3205,7 +3223,7 @@ class Run(object):
             lines_D[idx].set_zorder(len(lp) + 3)
             lines_V[idx].set_zorder(len(lp) + 3)
             if dlines is not None:
-                for i, lines in enumerate(lines_dlines + [lines_sig_sr, lines_sig_vuv] + lines_xtomo.values() + lines_dlines_norm):
+                for i, lines in enumerate(lines_dlines + [lines_sig_sr, lines_sig_vuv, lines_xtomo] + lines_dlines_norm):
                     lines[idx].set_alpha(1)
                     lines[idx].set_color('b')
                     lines[idx].set_linewidth(5)
@@ -3231,17 +3249,16 @@ class Run(object):
                 for j, l in enumerate(lines):
                     l.set_ydata(dlines_norm[j, idx, i, :])
             for i, l in enumerate(lines_sig_sr):
-                l.set_ydata(sbright[i, idx, :])
+                l.set_ydata(sig[0][i, idx, :])
             for i, l in enumerate(lines_sig_vuv):
-                l.set_ydata(vbright[i, idx, :])
-            for k, lines_x in lines_xtomo.iteritems():
-                for i, l in enumerate(lines_x):
-                    l.set_ydata(xtomobright[k][i, idx, :])
+                l.set_ydata(sig[1][i, idx, :])
+            for i, l in enumerate(lines_sig_xtomo):
+                l.set_ydata(sig[2][i, idx, :])
             
             # Update the errorbar plots:
-            t_idx_sr = profiletools.get_nearest_idx(time[idx] - self.time_1, self.run_data.hirex_time_combined)
-            y = self.run_data.hirex_signal_norm_combined[t_idx_sr, :]
-            yerr = self.run_data.hirex_uncertainty_norm_combined[t_idx_sr, :]
+            t_idx_sr = profiletools.get_nearest_idx(time[idx] - self.time_1, self.signals[0].t)
+            y = self.signals[0].y_norm[t_idx_sr, :] if self.normalize else self.signals[0].y[t_idx_sr, :]
+            yerr = self.signals[0].std_y_norm[t_idx_sr, :] if self.normalize else self.signals[0].std_y[t_idx_sr, :]
             line_data_sr.set_ydata(y)
             erry_top_data_sr.set_ydata(y + yerr)
             erry_bot_data_sr.set_ydata(y - yerr)
@@ -3250,9 +3267,9 @@ class Run(object):
             ]
             barsy_data_sr.set_segments(new_segments_y)
             
-            t_idx_vuv = profiletools.get_nearest_idx(time[idx] - self.time_1, self.run_data.vuv_times_combined[0, :])
-            y = self.run_data.vuv_signals_norm_combined[:, t_idx_vuv]
-            yerr = self.run_data.vuv_uncertainties_norm_combined[:, t_idx_vuv]
+            t_idx_vuv = profiletools.get_nearest_idx(time[idx] - self.time_1, self.signals[1].t)
+            y = self.signals[1].y_norm[t_idx_vuv, :] if self.normalize else self.signals[1].y[t_idx_vuv, :]
+            yerr = self.signals[1].std_y_norm[t_idx_vuv, :] if self.normalize else self.signals[1].std_y[t_idx_vuv, :]
             line_data_vuv.set_ydata(y)
             erry_top_data_vuv.set_ydata(y + yerr)
             erry_bot_data_vuv.set_ydata(y - yerr)
@@ -3261,17 +3278,16 @@ class Run(object):
             ]
             barsy_data_vuv.set_segments(new_segments_y)
             
-            for i, (k, s) in enumerate(self.run_data.xtomo_signal_norm_combined.iteritems()):
-                t_idx_xtomo = profiletools.get_nearest_idx(time[idx] - self.time_1, self.run_data.xtomo_times_combined[k])
-                y = s[:, t_idx_xtomo]
-                yerr = 0.1 * s[:, t_idx_xtomo]
-                line_data_xtomo[k].set_ydata(y)
-                erry_top_data_xtomo[k].set_ydata(y + yerr)
-                erry_bot_data_xtomo[k].set_ydata(y - yerr)
-                new_segments_y = [
-                    scipy.array([[x, yt], [x, yb]]) for x, yt, yb in zip(line_data_xtomo[k].get_xdata(), y + yerr, y - yerr)
-                ]
-                barsy_data_xtomo[k].set_segments(new_segments_y)
+            t_idx_xtomo = profiletools.get_nearest_idx(time[idx] - self.time_1, self.signals[2].t)
+            y = self.signals[2].y_norm[t_idx_xtomo, :] if self.normalize else self.signals[2].y[t_idx_xtomo, :]
+            yerr = self.signals[2].std_y_norm[t_idx_xtomo, :] if self.normalize else self.signals[2].std_y[t_idx_xtomo, :]
+            line_data_xtomo.set_ydata(y)
+            erry_top_data_xtomo.set_ydata(y + yerr)
+            erry_bot_data_xtomo.set_ydata(y - yerr)
+            new_segments_y = [
+                scipy.array([[x, yt], [x, yb]]) for x, yt, yb in zip(line_data_xtomo.get_xdata(), y + yerr, y - yerr)
+            ]
+            barsy_data_xtomo.set_segments(new_segments_y)
             
             for i, (l, a) in enumerate(zip(lines_dlines_true, a_lines)):
                 l.set_ydata(dlines_true[idx, i, :])
@@ -3282,18 +3298,17 @@ class Run(object):
                 a.relim()
                 a.autoscale(axis='y')
             
-            line_sig_sr_true.set_ydata(sbright_true[idx, :])
+            line_sig_sr_true.set_ydata(sig_true[0][idx, :])
             a_sr.relim()
             a_sr.autoscale(axis='y')
             
-            line_sig_vuv_true.set_ydata(vbright_true[idx, :])
+            line_sig_vuv_true.set_ydata(sig_true[1][idx, :])
             a_vuv.relim()
             a_vuv.autoscale(axis='y')
             
-            for (k, l), a in zip(lines_xtomo_true.iteritems(), a_xtomo):
-                l.set_ydata(xtomobright_true[k][idx, :])
-                a.relim()
-                a.autoscale(axis='y')
+            line_sig_xtomo_true.set_ydata(sig_true[2][idx, :])
+            a_xtomo.relim()
+            a_xtomo.autoscale(axis='y')
             
             title.set_text("%s, lp=%.4g, t=%.3gs" % (OPT_STATUS[status[sl.val]], lp[sl.val], time[idx] - self.time_1))
             f.canvas.draw()
@@ -3976,10 +3991,9 @@ class Run(object):
         t_v = chain_flat[good, -1]
         
         # We need to interpolate sbright, vbright onto a uniform timebase:
-        # TODO: Update this!
         t = scipy.linspace(
-            self.run_data.hirex_time_combined.min(),
-            self.run_data.hirex_time_combined.max(),
+            self.signals[0].t.min(),
+            self.signals[0].t.max(),
             100
         )
         
@@ -3988,6 +4002,7 @@ class Run(object):
         
         sbright_interp = scipy.asarray([o[0] for o in out], dtype=float)
         vbright_interp = scipy.asarray([o[1] for o in out], dtype=float)
+        xbright_interp = scipy.asarray([o[2] for o in out], dtype=float)
         
         # Now we can compute the summary statistics:
         mean_sbright = scipy.mean(sbright_interp, axis=0)
@@ -3997,7 +4012,7 @@ class Run(object):
         std_vbright = scipy.std(vbright_interp, axis=0, ddof=1)
         
         # And make a big plot:
-        f_D, a_H, a_V = self.run_data.plot_data()
+        f_H, a_H = self.signals[0].plot_data(norm=self.normalize)
         for i, a in enumerate(a_H):
             a.plot(t, mean_sbright[:, i], 'g')
             a.fill_between(
@@ -4008,6 +4023,7 @@ class Run(object):
                 alpha=0.5
             )
         
+        f_V, a_V = self.signals[1].plot_data(norm=self.normalize)
         for i, a in enumerate(a_V):
             a.plot(t, mean_vbright[:, i], 'g')
             a.fill_between(
@@ -4136,8 +4152,9 @@ class Run(object):
         """
         l = []
         # TODO: Update this!
-        f_b, a_H, a_VUV = self.run_data.plot_data()
-        title_f_b = f_b.suptitle('')
+        f_H, a_H = self.signals[0].plot_data(norm=self.normalize)
+        f_VUV, a_VUV = self.signals[1].plot_data(norm=self.normalize)
+        title_f_H = f_H.suptitle('')
         
         f_DV = plt.figure()
         title_f_DV = f_DV.suptitle('')
@@ -4183,7 +4200,7 @@ class Run(object):
                 b[0],
                 sampler.lnprobability[i_chain, i_step]
             )
-            title_f_b.set_text(title_text)
+            title_f_H.set_text(title_text)
             title_f_DV.set_text(title_text)
             title_f_chains.set_text(title_text)
             
@@ -4214,7 +4231,8 @@ class Run(object):
                 )
                 l.append(a_chains[k].axvline(i_step, color='r', linewidth=3))
             
-            f_b.canvas.draw()
+            f_H.canvas.draw()
+            f_VUV.canvas.draw()
             f_DV.canvas.draw()
             f_chains.canvas.draw()
             print("Done.")
@@ -4325,23 +4343,13 @@ class Run(object):
     def ll_normalization(self):
         """Returns the normalization constant for the log-likelihood.
         """
-        # TODO: This way of dropping LoWEUS breaks if a.) LoWEUS is not loaded
-        # or b.) if LoWEUS is not the last line or c.) if there are multiple
-        # LoWEUS lines. This should be corrected at some point...
-        # TODO: Update this!
         if self._ll_normalization is None:
-            good_err = scipy.hstack(
-                (
-                    self.run_data.hirex_uncertainty_norm_combined[
-                        ~self.run_data.hirex_flagged_combined
-                    ],
-                    (
-                        self.run_data.vuv_uncertainties_norm_combined.ravel()
-                        if True or self.include_loweus
-                        else self.run_data.vuv_uncertainties_norm_combined[:-1, :].ravel()
-                    )
-                )
-            )
+            good_err = []
+            for s in self.signals:
+                if self.normalize:
+                    good_err.extend(s.std_y_norm[~scipy.isnan(s.y_norm)].ravel())
+                else:
+                    good_err.extend(s.std_y[~scipy.isnan(s.y)].ravel())
             self._ll_normalization = (
                 -scipy.log(good_err).sum() - 0.5 * len(good_err) * scipy.log(2 * scipy.pi)
             )
@@ -4352,10 +4360,10 @@ class Run(object):
         """Returns the normalization constant for the log-likelihood of the Ar data.
         """
         if self._ar_ll_normalization is None:
-            ar_mask = (self.run_data.ar_time >= self.time_1) & (self.run_data.ar_time <= self.time_2)
-            ar_uncertainty = self.run_data.ar_uncertainty[ar_mask, :]
-            ar_flagged = self.run_data.ar_flagged[ar_mask, :]
-            good_err = ar_uncertainty.ravel()[~ar_flagged.ravel()]
+            if self.normalize:
+                good_err = self.ar_signal.std_y_norm[~scipy.isnan(self.ar_signal.y_norm)].ravel()
+            else:
+                good_err = self.ar_signal.std_y[~scipy.isnan(self.ar_signal.y)].ravel()
             self._ar_ll_normalization = (
                 -scipy.log(good_err).sum() - 0.5 * len(good_err) * scipy.log(2 * scipy.pi)
             )
@@ -4379,86 +4387,81 @@ class Run(object):
         print("Created %s." % (new_dir,))
         
         # Switch to that directory to initialize the IDL side of things:
-        if self.params_true is None:
-            print("Running setup_strahl_run...")
-            os.chdir(new_dir)
-            if not os.path.isfile('run_data.sav'):
-                cmd = "idl <<EOF\n.compile setup_strahl_run.pro\nsetup_strahl_run, {shot}, {time_1}, {time_2}".format(
-                    shot=self.shot,
-                    time_1=self.time_1,
-                    time_2=self.time_2
-                )
-                try:
-                    cmd += ', tht={tht}'.format(tht=self.tht)
-                except AttributeError:
-                    pass
-                try:
-                    cmd += ', line={line}'.format(line=self.line)
-                except AttributeError:
-                    pass
-                cmd += '\nexit\nEOF'
-                
-                subprocess.call(cmd, shell=True)
-            else:
-                print("run_data.sav already in place. You may want to make sure it matches!")
+        print("Running setup_strahl_run...")
+        os.chdir(new_dir)
+        if not os.path.isfile('run_data.sav'):
+            cmd = "idl <<EOF\n.compile setup_strahl_run.pro\nsetup_strahl_run, {shot}, {time_1}, {time_2}".format(
+                shot=self.shot,
+                time_1=self.time_1,
+                time_2=self.time_2
+            )
+            try:
+                cmd += ', tht={tht}'.format(tht=self.tht)
+            except AttributeError:
+                pass
+            try:
+                cmd += ', line={line}'.format(line=self.line)
+            except AttributeError:
+                pass
+            cmd += '\nexit\nEOF'
+            
+            subprocess.call(cmd, shell=True)
+        else:
+            print("run_data.sav already in place. You may want to make sure it matches!")
         
         print("Setup of files complete.")
     
-    def write_atomdat(self, vuv_data):
-        """Write the Ca.atomdat file:
+    def write_atomdat(self, vuv_data, li_like=None, be_like=None):
+        """Write the Ca.atomdat file.
+        
+        Parameters
+        ----------
+        vuv_data : :py:class:`VUVData`
+            Class holding the XEUS and LoWEUS line information. If set to None,
+            explicit values can be set using the lines below.
+        li_like : array of int, optional
+            Indices in `CA_17_LINES` to use. Default is None.
+        be_like : array of int, optional
+            Indices in `CA_16_LINES` to use. Default is None.
         """
-        # TODO: This should be generalized for other HiReX-SR lines.
         line_spec = LINE_SPEC_TEMPLATE.format(charge=18, wavelength=3.173, halfwidth=0.001)
-        # self.hirex_line_idx = 0
-        # self.xeus_line_idxs = []
-        # self.loweus_line_idxs = []
-        # k = 1
-        for spectrometer, s in vuv_data.vuv_lines.iteritems():
-            for l in s:
-                if l.diagnostic_lines is not None:
-                    # if spectrometer == 'XEUS':
-                    #     self.xeus_line_idxs.append(k)
-                    # elif spectrometer == 'LoWEUS':
-                    #     self.loweus_line_idxs.append(k)
-                    # k += 1
-                    # New way: pick the highest and lowest line, and go
-                    # 0.0001nm to either side:
-                    # Note that this assumes you haven't mixed charge states in
-                    # a given line, since STRAHL doesn't appear to support this!
-                    # TODO: I should be able to add support for that in my own
-                    # code, if needed.
-                    lam = CA_LINES[l.diagnostic_lines]
-                    i_max = lam.argmax()
-                    i_min = lam.argmin()
-                    l_max = lam[i_max]
-                    l_min = lam[i_min]
-                    cwl = (l_max + l_min) / 2.0
-                    halfwidth = (l_max - l_min) / 2.0 + 0.0001
-                    if max(l.diagnostic_lines) < len(CA_17_LINES):
-                        line_spec += LINE_SPEC_TEMPLATE.format(
-                            charge=17,
-                            wavelength=cwl * 10.0,
-                            halfwidth=halfwidth * 10.0
-                        )
-                    else:
-                        line_spec += LINE_SPEC_TEMPLATE.format(
-                            charge=16,
-                            wavelength=cwl * 10.0,
-                            halfwidth=halfwidth * 10.0
-                        )
-                    
-                    # Old way: put each line in with a tiny window:
-                    # for i in l.diagnostic_lines:
-                    #     if i < len(CA_17_LINES):
-                    #         line_spec += LINE_SPEC_TEMPLATE.format(
-                    #             charge=17,
-                    #             wavelength=CA_17_LINES[i] * 10.0
-                    #         )
-                    #     else:
-                    #         line_spec += LINE_SPEC_TEMPLATE.format(
-                    #             charge=16,
-                    #             wavelength=CA_16_LINES[i - len(CA_17_LINES)] * 10.0
-                    #         )
+        if li_like is not None:
+            for idx in li_like:
+                line_spec += LINE_SPEC_TEMPLATE.format(
+                    charge=17,
+                    wavelength=CA_17_LINES[idx] * 10.0,
+                    halfwidth=0.0001
+                )
+        if be_like is not None:
+            for idx in be_like:
+                line_spec += LINE_SPEC_TEMPLATE.format(
+                    charge=16,
+                    wavelength=CA_16_LINES[idx] * 10.0,
+                    halfwidth=0.0001
+                )
+        if vuv_data is not None:
+            for spectrometer, s in vuv_data.vuv_lines.iteritems():
+                for l in s:
+                    if l.diagnostic_lines is not None:
+                        lam = CA_LINES[l.diagnostic_lines]
+                        i_max = lam.argmax()
+                        i_min = lam.argmin()
+                        l_max = lam[i_max]
+                        l_min = lam[i_min]
+                        cwl = (l_max + l_min) / 2.0
+                        halfwidth = (l_max - l_min) / 2.0 + 0.0001
+                        if max(l.diagnostic_lines) < len(CA_17_LINES):
+                            line_spec += LINE_SPEC_TEMPLATE.format(
+                                charge=17,
+                                wavelength=cwl * 10.0,
+                                halfwidth=halfwidth * 10.0
+                            )
+                        else:
+                            line_spec += LINE_SPEC_TEMPLATE.format(
+                                charge=16,
+                                wavelength=cwl * 10.0,
+                                halfwidth=halfwidth * 10.0
+                            )
         with open('Ca.atomdat', 'w') as f:
             f.write(
                 CA_ATOMDAT_TEMPLATE.format(
@@ -5406,13 +5409,6 @@ class RunData(object):
         print("Loading ne data...")
         self.load_ne()
         
-        # print("Fetching source data...")
-        # # TODO: This needs to be generalized!
-        # shutil.copyfile(
-        #     self.settings.source_file,
-        #     'nete/Caflx%d.dat' % (self.settings.shot,)
-        # )
-        
         print("Loading and processing of run data complete.")
     
     def load_Te(self):
@@ -5452,6 +5448,37 @@ class RunData(object):
         argv += [str(x) for x in self.roa_grid]
         argv += flags
         return profiletools.gui.run_gui(argv=argv)
+
+class TruthData(object):
+    """Class to hold the truth values for synthetic data.
+    """
+    def __init__(
+            self,
+            params_true,
+            cs_den,
+            dlines,
+            sig_abs,
+            sig_norm,
+            time,
+            sqrtpsinorm,
+            cs_den_ar,
+            dlines_ar,
+            sig_abs_ar,
+            sig_norm_ar,
+            time_ar
+        ):
+        self.params_true = params_true
+        self.cs_den = cs_den
+        self.dlines = dlines
+        self.sig_abs = sig_abs
+        self.sig_norm = sig_norm
+        self.time = time
+        self.sqrtpsinorm = sqrtpsinorm
+        self.cs_den_ar = cs_den_ar
+        self.dlines_ar = dlines_ar
+        self.sig_abs_ar = sig_abs_ar
+        self.sig_norm_ar = sig_norm_ar
+        self.time_ar = time_ar
 
 class Injection(object):
     """Class to store information on a given injection.
@@ -5566,7 +5593,18 @@ class Signal(object):
             if len(self.blocks) != self.y.shape[1]:
                 raise ValueError("1d blocks must have the same number of elements as the second dimension of y!")
     
-    def plot_data(self, norm=False, f=None, share_y=False, y_label='$b$ [AU]', max_ticks=None, rot_label=False):
+    def sort_t(self):
+        """Sort the time axis.
+        """
+        srt = self.t.argsort()
+        self.t = self.t[srt]
+        self.y = self.y[srt, :]
+        self.std_y = self.std_y[srt, :]
+        self.y_norm = self.y_norm[srt, :]
+        self.std_y_norm = self.std_y_norm[srt, :]
+    
+    def plot_data(self, norm=False, f=None, share_y=False, y_label='$b$ [AU]',
+                  max_ticks=None, rot_label=False, fast=False, ncol=6):
         """Make a big plot with all of the data.
         
         Parameters
@@ -5587,6 +5625,11 @@ class Signal(object):
         rot_label : bool, optional
             If True, the x axis labels will be rotated 90 degrees. Default is
             False (do not rotate).
+        fast : bool, optional
+            If True, errorbars will not be drawn in order to make the plotting
+            faster. Default is False
+        ncol : int, optional
+            The number of columns to use. Default is 6.
         """
         if norm:
             y = self.y_norm
@@ -5598,7 +5641,7 @@ class Signal(object):
         if f is None:
             f = plt.figure()
         
-        ncol = min(6, self.y.shape[1])
+        ncol = int(min(ncol, self.y.shape[1]))
         nrow = int(scipy.ceil(1.0 * self.y.shape[1] / ncol))
         gs = mplgs.GridSpec(nrow, ncol)
         
@@ -5630,12 +5673,10 @@ class Signal(object):
                 i_row += 1
             a[-1].set_title('%s, %d' % (self.name[k], k))
             good = ~scipy.isnan(self.y[:, k])
-            a[-1].errorbar(
-                self.t[good],
-                y[good, k],
-                yerr=std_y[good, k],
-                fmt='.'
-            )
+            if fast:
+                a[-1].plot(self.t[good], y[good, k], '.')
+            else:
+                a[-1].errorbar(self.t[good], y[good, k], yerr=std_y[good, k], fmt='.')
             if max_ticks is not None:
                 a[-1].xaxis.set_major_locator(plt.MaxNLocator(nbins=max_ticks - 1))
                 a[-1].yaxis.set_major_locator(plt.MaxNLocator(nbins=max_ticks - 1))
@@ -8097,15 +8138,18 @@ def flush_blobs(sampler, burn):
             b_chains[i_chain] = (-scipy.inf, None, None, None, 'cleared')
 
 class _InterpBrightWrapper(object):
-    def __init__(self, t, num_s, num_v):
+    def __init__(self, t, num_s, num_v, num_x):
         self.t = t
         self.num_s = num_s
         self.num_v = num_v
+        self.num_x = num_x
     
     def __call__(self, params):
+        # TODO: This needs to be updated to handle XTOMO -- implementation is incomplete!
         s, v, t_, dt_s, dt_v = params
         sbright_interp = scipy.zeros((len(self.t), self.num_s))
         vbright_interp = scipy.zeros((len(self.t), self.num_v))
+        xbright_interp = scipy.zeros((len(self.t), self.num_x))
         
         postinj_s = (self.t >= dt_s)
         for j in xrange(0, s.shape[1]):
@@ -8120,21 +8164,36 @@ class _InterpBrightWrapper(object):
                 v[:, j]
             )(self.t[postinj_v])
         
-        return (sbright_interp, vbright_interp)
+        return (sbright_interp, vbright_interp, xbright_interp)
 
 class HirexVuvFrame(tk.Frame):
     def __init__(self, *args, **kwargs):
         tk.Frame.__init__(self, *args, **kwargs)
         
-        self.f = Figure()
-        self.suptitle = self.f.suptitle("")
+        self.h_frame = tk.Frame(self)
+        self.h_frame.grid(row=0, column=0, sticky='NESW')
+        self.h_frame.grid_columnconfigure(0, weight=1)
+        self.h_frame.grid_rowconfigure(0, weight=1)
         
-        self.canvas = FigureCanvasTkAgg(self.f, master=self)
-        self.canvas.show()
-        self.canvas.get_tk_widget().grid(row=0, column=0, sticky='NESW')
+        self.v_frame = tk.Frame(self)
+        self.v_frame.grid(row=0, column=1, sticky='NESW')
+        self.v_frame.grid_columnconfigure(0, weight=1)
+        self.v_frame.grid_rowconfigure(0, weight=1)
         
-        # TODO: Update this!
-        dum, self.a_H, self.a_V = self.master.r.run_data.plot_data(f=self.f)
+        self.f_h = Figure()
+        self.suptitle_h = self.f_h.suptitle("")
+        self.f_v = Figure()
+        self.suptitle_v = self.f_v.suptitle("")
+        
+        self.canvas_h = FigureCanvasTkAgg(self.f_h, master=self.h_frame)
+        self.canvas_h.show()
+        self.canvas_h.get_tk_widget().grid(row=0, column=0, sticky='NESW')
+        self.canvas_v = FigureCanvasTkAgg(self.f_v, master=self.v_frame)
+        self.canvas_v.show()
+        self.canvas_v.get_tk_widget().grid(row=0, column=0, sticky='NESW')
+        
+        dum, self.a_H = self.master.r.signals[0].plot_data(f=self.f_h, norm=self.master.r.normalize)
+        dum, self.a_V = self.master.r.signals[1].plot_data(f=self.f_v, norm=self.master.r.normalize, ncol=1)
         
         # Make dummy lines to modify data in:
         self.l_H = []
@@ -8154,16 +8213,26 @@ class HirexVuvFrame(tk.Frame):
         
         # Need to put the toolbar in its own frame, since it automatically calls
         # pack on itself, but I am using grid.
-        self.toolbar_frame = tk.Frame(self)
-        self.toolbar = NavigationToolbar2TkAgg(self.canvas, self.toolbar_frame)
-        self.toolbar.update()
-        self.toolbar_frame.grid(row=1, column=0, sticky='EW')
+        self.toolbar_frame_h = tk.Frame(self)
+        self.toolbar_h = NavigationToolbar2TkAgg(self.canvas_h, self.toolbar_frame_h)
+        self.toolbar_h.update()
+        self.toolbar_frame_h.grid(row=1, column=0, sticky='EW')
         
-        self.canvas.mpl_connect(
+        self.toolbar_frame_v = tk.Frame(self)
+        self.toolbar_v = NavigationToolbar2TkAgg(self.canvas_v, self.toolbar_frame_v)
+        self.toolbar_v.update()
+        self.toolbar_frame_v.grid(row=1, column=1, sticky='EW')
+        
+        self.canvas_h.mpl_connect(
             'button_press_event',
-            lambda event: self.canvas._tkcanvas.focus_set()
+            lambda event: self.canvas_h._tkcanvas.focus_set()
         )
-        self.canvas.mpl_connect('key_press_event', self.on_key_event)
+        self.canvas_h.mpl_connect('key_press_event', self.on_key_event)
+        self.canvas_v.mpl_connect(
+            'button_press_event',
+            lambda event: self.canvas_v._tkcanvas.focus_set()
+        )
+        self.canvas_v.mpl_connect('key_press_event', self.on_key_event)
         
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -8254,11 +8323,9 @@ class XTOMOExplorerPlotFrame(tk.Frame):
         self.canvas.show()
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky='NESW')
         
-        dum, self.a_X = self.master.master.r.run_data.plot_xtomo(
-            self.system,
-            norm=True,
-            f=self.f,
-            boxcar=1001
+        dum, self.a_X = self.master.master.r.signals[2].plot_data(
+            norm=self.master.master.r.normalize,
+            f=self.f
         )
         
         # Make dummy lines to modify data in:
@@ -8296,10 +8363,7 @@ class XTOMOExplorerWindow(tk.Toplevel):
     def __init__(self, *args, **kwargs):
         tk.Toplevel.__init__(self, *args, **kwargs)
         
-        self.XTOMO_frames = [
-            XTOMOExplorerPlotFrame(k, self) for k in self.master.r.run_data.xtomo_sig.keys()
-            if self.master.r.run_data.xtomo_sig[k] is not None
-        ]
+        self.XTOMO_frames = [XTOMOExplorerPlotFrame(0, self),]
         for k, f in enumerate(self.XTOMO_frames):
             f.grid(row=0, column=k, sticky='NESW')
         
@@ -8342,7 +8406,6 @@ class ParameterExplorer(tk.Tk):
         
         self.XTOMO_window = XTOMOExplorerWindow(self)
         
-        
     def apply(self, evt=None):
         print("begin apply...")
         params = [float(b.get()) for b in self.parameter_frame.boxes]
@@ -8360,27 +8423,31 @@ class ParameterExplorer(tk.Tk):
             print('fail!')
             return
         dlines = self.r.cs_den2dlines(params, cs_den, sqrtpsinorm, time, ne, Te)
-        sbright, vbright, xtomobright = self.r.dlines2sig(params, dlines, time)
-        lp = self.r.sig2ln_prob(params, sbright, vbright, xtomobright, time)
-        self.hirex_vuv_frame.suptitle.set_text("%.3e" % (lp,))
+        sig = self.r.dlines2sig(params, dlines, time)
+        lp = self.r.sig2ln_prob(params, sig, time)
+        self.hirex_vuv_frame.suptitle_h.set_text("%.3e" % (lp,))
+        self.hirex_vuv_frame.suptitle_v.set_text("%.3e" % (lp,))
         
         eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.r.split_params(params)
         
         time = time - self.r.time_1
-        time_s = time + param_source[0]
-        time_v = time + param_source[1]
-        time_xtomo = time + param_source[2]
+        time_s = scipy.sort(self.r.signals[0].t + param_source[0])
+        time_v = scipy.sort(self.r.signals[1].t + param_source[1])
+        time_xtomo = scipy.sort(self.r.signals[2].t + param_source[2])
         
         for k, l in enumerate(self.hirex_vuv_frame.l_H):
-            l.set_ydata(sbright[:, k])
+            l.set_ydata(sig[0][:, k])
             l.set_xdata(time_s)
         for k, l in enumerate(self.hirex_vuv_frame.l_V):
-            l.set_ydata(vbright[:, k])
+            l.set_ydata(sig[1][:, k])
             l.set_xdata(time_v)
+        # TODO: This is an ugly holdover from how this used to be done...should
+        # be updated.
         for frame in self.XTOMO_window.XTOMO_frames:
             for k, l in enumerate(frame.l_X):
-                l.set_ydata(xtomobright[frame.system][:, k])
+                l.set_ydata(sig[2][:, k])
                 l.set_xdata(time_xtomo)
             frame.f.canvas.draw()
-        self.hirex_vuv_frame.f.canvas.draw()
+        self.hirex_vuv_frame.f_h.canvas.draw()
+        self.hirex_vuv_frame.f_v.canvas.draw()
         print("apply done!")
