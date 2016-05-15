@@ -27,6 +27,7 @@ plt.ion()
 import matplotlib.gridspec as mplgs
 import matplotlib.widgets as mplw
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.colors import LogNorm
 import profiletools
 import profiletools.gui
 import gptools
@@ -2486,6 +2487,163 @@ class Run(object):
             print(time_.time() - start)
         return out
     
+    def parallel_compute_cs_den(self, D_grid, V_grid, pool):
+        eval_obj = _ComputeCSDenEval(self)
+        DD, VV = scipy.meshgrid(D_grid, V_grid)
+        orig_shape = DD.shape
+        DD = DD.ravel()
+        VV = VV.ravel()
+        res = pool.map(eval_obj, zip(DD, VV))
+        
+        return res
+    
+    def process_cs_den(self, res, D_grid, V_grid):
+        DD, VV = scipy.meshgrid(D_grid, V_grid)
+        orig_shape = DD.shape
+        
+        # Make a single density evolution plot which can be updated:
+        rr = res[1]
+        f_n = plt.figure()
+        a_n = f_n.add_subplot(1, 1, 1)
+        pcm_n = a_n.pcolormesh(self.truth_data.sqrtpsinorm, self.truth_data.time, rr.cs_den.sum(axis=1), cmap='gray_r')
+        cb_n = f_n.colorbar(pcm_n)
+        l_local_n, = a_n.plot(self.truth_data.sqrtpsinorm, rr.t_n_peak_local, 'b')
+        l_global_n, = a_n.plot(rr.sqrtpsinorm_n_peak_global, rr.t_n_peak_global, 'ro')
+        a_n.set_xlabel(r'$\sqrt{\psi_n}$')
+        a_n.set_ylabel(r'$t$ [s]')
+        a_n.set_title("total Ca, $D=%.2f$m$^2$/s, $V=%.2f$m/s" % (rr.DV[0], rr.DV[1]))
+        
+        def on_click(event):
+            if event.xdata is None or event.ydata is None:
+                return
+            
+            D_idx = profiletools.get_nearest_idx(event.xdata, D_grid)
+            V_idx = profiletools.get_nearest_idx(event.ydata, V_grid)
+            
+            rr = res[V_idx * len(D_grid) + D_idx]
+            
+            pcm_n.set_array(rr.cs_den.sum(axis=1)[:-1, :-1].ravel())
+            pcm_n.set_clim(rr.cs_den.sum(axis=1).min(), rr.cs_den.sum(axis=1).max())
+            l_local_n.set_ydata(rr.t_n_peak_local)
+            l_global_n.set_ydata(rr.t_n_peak_global)
+            l_global_n.set_xdata(rr.sqrtpsinorm_n_peak_global)
+            
+            a_n.set_title("total Ca, $D=%.2f$m$^2$/s, $V=%.2f$m/s" % (rr.DV[0], rr.DV[1]))
+            f_n.canvas.draw()
+        
+        # Total impurity confinement time:
+        tau_N = scipy.reshape(scipy.asarray([rr.tau_N for rr in res]), orig_shape)
+        
+        f = plt.figure()
+        a = f.add_subplot(1, 1, 1)
+        pcm = a.pcolormesh(
+            D_grid[1:],
+            V_grid,
+            tau_N[:, 1:] * 1e3,
+            cmap='gray_r',
+            norm=LogNorm(vmin=tau_N[:, 1:].min() * 1e3, vmax=tau_N[:, 1:].max() * 1e3)
+        )
+        f.colorbar(pcm)
+        a.set_xlabel("$D$ [m$^2$/s]")
+        a.set_ylabel("$V$ [m/s]")
+        a.set_title(r"$\tau_{\mathrm{imp}}$ [ms]")
+        
+        f.canvas.mpl_connect('button_press_event', on_click)
+        
+        # Compare to the result from SeguinPRL1983:
+        aa = self.efit_tree.getAOutSpline()((self.time_1 + self.time_2) / 2.0)
+        # Segiun uses positive V for inwards, so I need a sign correction.
+        SS = -aa * VV / (2.0 * DD)
+        tau_0_approx = (77.0 + SS**2.0) * (scipy.exp(SS) - SS - 1.0) * aa**2.0 / ((56.0 + SS**2.0) * 4.0 * SS**2.0 * DD)
+        
+        f = plt.figure()
+        a = f.add_subplot(1, 1, 1)
+        pcm = a.pcolormesh(
+            D_grid[1:],
+            V_grid,
+            tau_0_approx[:, 1:] * 1e3,
+            cmap='gray_r',
+            norm=LogNorm(vmin=tau_N[:, 1:].min() * 1e3, vmax=tau_N[:, 1:].max() * 1e3)
+        )
+        f.colorbar(pcm)
+        a.set_xlabel("$D$ [m$^2$/s]")
+        a.set_ylabel("$V$ [m/s]")
+        a.set_title(r"Seguin's $\tau_{\mathrm{imp}}$ [ms]")
+        
+        # (core n peaking time) - (edge n peaking time)
+        dt_peak = scipy.reshape(scipy.asarray([rr.t_n_peak_local[0] - rr.t_n_peak_local[-1] for rr in res]), orig_shape)
+        
+        f = plt.figure()
+        a = f.add_subplot(1, 1, 1)
+        pcm = a.pcolormesh(D_grid[1:], V_grid, dt_peak[:, 1:] * 1e3, cmap='gray_r')
+        f.colorbar(pcm)
+        a.set_xlabel("$D$ [m$^2$/s]")
+        a.set_ylabel("$V$ [m/s]")
+        a.set_title(r"peaking time difference [ms]")
+        
+        f.canvas.mpl_connect('button_press_event', on_click)
+        
+        # Compare to result from FussmannNF1986:
+        # This doesn't seem to be describing the same thing...
+        tau_2_approx = 0.03 * aa**2.0 / DD
+        
+        f = plt.figure()
+        a = f.add_subplot(1, 1, 1)
+        pcm = a.pcolormesh(D_grid, V_grid, tau_2_approx * 1e3, vmin=0, cmap='gray_r')
+        f.colorbar(pcm)
+        a.set_xlabel("$D$ [m$^2$/s]")
+        a.set_ylabel("$V$ [m/s]")
+        a.set_title(r"Fussmann's $\tau_2$ [ms]")
+        
+        # (core H-like peaking time) - (edge H-like peaking time)
+        dt_peak_H = scipy.reshape(scipy.asarray([rr.t_cs_den_peak_local[-2, 0] - rr.t_cs_den_peak_local[-2, -1] for rr in res]), orig_shape)
+        
+        f = plt.figure()
+        a = f.add_subplot(1, 1, 1)
+        pcm = a.pcolormesh(D_grid, V_grid, dt_peak_H * 1e3, cmap='gray_r')
+        f.colorbar(pcm)
+        a.set_xlabel("$D$ [m$^2$/s]")
+        a.set_ylabel("$V$ [m/s]")
+        a.set_title(r"He-like peaking time difference [ms]")
+        
+        # Make plots of the evolution for each charge state, plus the total
+        # impurity density:
+        # THIS WILL TAKE FOREVER IF YOU HAVE MANY CASES!
+        for rr in res:
+            for i in range(0, rr.cs_den.shape[1]):
+                f = plt.figure()
+                a = f.add_subplot(1, 1, 1)
+                pcm = a.pcolormesh(self.truth_data.sqrtpsinorm, self.truth_data.time, rr.cs_den[:, i, :], cmap='gray_r')
+                f.colorbar(pcm)
+                a.plot(self.truth_data.sqrtpsinorm, rr.t_cs_den_peak_local[i, :], 'b')
+                a.plot(rr.sqrtpsinorm_cs_den_peak_global[i], rr.t_cs_den_peak_global[i], 'ro')
+                # for s_idx in range(0, len(self.truth_data.sqrtpsinorm)):
+                #     a.plot(
+                #         (self.truth_data.sqrtpsinorm[s_idx], self.truth_data.sqrtpsinorm[s_idx]),
+                #         (rr.t_cs_den_peak_local[i, s_idx], rr.t_cs_den_peak_local[i, s_idx] + rr.tau_cs_den_local[i, s_idx]), 'g'
+                #     )
+                a.set_xlabel(r'$\sqrt{\psi_n}$')
+                a.set_ylabel(r'$t$ [s]')
+                a.set_title("Ca$^{%d+}$" % (i,) if i > 0 else "Ca$^{%d}$" % (i,))
+            
+            # Total impurity density:
+            f = plt.figure()
+            a = f.add_subplot(1, 1, 1)
+            pcm = a.pcolormesh(self.truth_data.sqrtpsinorm, self.truth_data.time, rr.cs_den.sum(axis=1), cmap='gray_r')
+            f.colorbar(pcm)
+            a.plot(self.truth_data.sqrtpsinorm, rr.t_n_peak_local, 'b')
+            a.plot(rr.sqrtpsinorm_n_peak_global, rr.t_n_peak_global, 'ro')
+            # for s_idx in range(0, len(self.truth_data.sqrtpsinorm)):
+            #     a.plot(
+            #         (self.truth_data.sqrtpsinorm[s_idx], self.truth_data.sqrtpsinorm[s_idx]),
+            #         (rr.t_n_peak_global[s_idx], rr.t_n_peak_local[s_idx] + rr.tau_n_local[s_idx]), 'g'
+            #     )
+            a.set_xlabel(r'$\sqrt{\psi_n}$')
+            a.set_ylabel(r'$t$ [s]')
+            a.set_title("total Ca")
+            
+        
+    
     def find_MAP_estimate(self, random_starts=None, num_proc=None, pool=None, theta0=None, thresh=None):
         """Find the most likely parameters given the data.
         
@@ -4695,8 +4853,8 @@ class Run(object):
             "                  2\n"
             "\n"
             "cv    time   dt at start   increase of dt after cycle   steps per cycle\n"
-            "    {time_1:.5f}     0.00010               1.001                      10\n"
-            "    {time_2:.5f}     0.00010               1.001                      10\n"
+            "    {time_1:.5f}     0.000010               1.001                      10\n"
+            "    {time_2:.5f}     0.000010               1.001                      10\n"
             "\n"
             "                    S O U R C E\n"
             "cv    position(cm)    constant rate (1/s)    time dependent rate from file\n"
@@ -6389,6 +6547,135 @@ class _UGradEval(object):
     
     def __call__(self, p):
         return self.run.u2ln_prob(p, sign=self.sign, **self.kwargs)
+
+class _CSDenResult(object):
+    """Helper object to hold the results of :py:class:`_ComputeCSDenEval`.
+    """
+    def __init__(self, DV, cs_den):
+        self.DV = DV
+        self.cs_den = cs_den
+
+class _ComputeCSDenEval(object):
+    """Wrapper class to allow parallel evaluation of charge state density profiles.
+    
+    Also computes the following:
+    
+    * Time at which each charge state peaks at each location. This will be
+      of shape (`n_cs`, `n_space`).
+    * The peak value of each charge state at each location. This will be of
+      shape (`n_cs`, `n_space`).
+    
+    * Time at which each charge state reaches its highest local value
+      (across all spatial points). This will be of shape (`n_cs`,).
+    * The peak value of each charge state across all spatial points. This
+      will be of shape (`n_cs`,).
+    * The spatial point at which each charge state across all spatial points
+      reaches its peak value. This will be of shape (`n_cs`,).
+    
+    * Time at which the total impurity density peaks at each location. This
+      will be of shape (`n_space`,).
+    * The peak value of the total impurity density at each location. This
+      will be of shape (`n_space`,).
+    
+    * The time at which the total impurity density peaks (across all spatial
+      points). This will be a single float.
+    * The peak value of the total impurity density across all spatial
+      points. This will be a single float.
+    * The spatial point at which the total impurity density across all
+      spatial points reaches its peak value. This will be a single float.
+    
+    * The time at which the total impurity content peaks. This will be a
+      single float.
+    * The peak number of impurity atoms in the plasma. This will be a single
+      float.
+    
+    * The confinement time for each charge state and each location. This
+      will be of shape (`n_cs`, `n_space`).
+    * The confinement time for the total impurity density at each location.
+      This will be of shape (`n_space`,).
+    * The confinement time for the total impurity content. This will be a
+      single float.
+    """
+    def __init__(self, run):
+        self.run = run
+    
+    def __call__(self, DV):
+        p = scipy.concatenate((DV, [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.0, 0.0, 0.0]))
+        cs_den, sqrtpsinorm, time, ne, Te = self.run.DV2cs_den(p)
+        
+        res = _CSDenResult(DV, cs_den)
+        
+        # For each charge state and location:
+        i_peak_local = cs_den.argmax(axis=0)
+        res.t_cs_den_peak_local = self.run.truth_data.time[i_peak_local]
+        res.cs_den_peak_local = cs_den.max(axis=0)
+        
+        # For each charge state across all locations:
+        i_peak_global = res.cs_den_peak_local.argmax(axis=1)
+        res.t_cs_den_peak_global = res.t_cs_den_peak_local[range(cs_den.shape[1]), i_peak_global]
+        res.cs_den_peak_global = res.cs_den_peak_local.max(axis=1)
+        res.sqrtpsinorm_cs_den_peak_global = self.run.truth_data.sqrtpsinorm[i_peak_global]
+        
+        # For total impurity density at each location:
+        n = cs_den.sum(axis=1) # shape is (`n_time`, `n_space`)
+        i_n_peak_local = n.argmax(axis=0)
+        res.t_n_peak_local = self.run.truth_data.time[i_n_peak_local]
+        res.n_peak_local = n.max(axis=0)
+        
+        # For total impurity density across all locations:
+        i_n_peak_global = res.n_peak_local.argmax()
+        res.t_n_peak_global = res.t_n_peak_local[i_n_peak_global]
+        res.n_peak_global = res.n_peak_local[i_n_peak_global]
+        res.sqrtpsinorm_n_peak_global = self.run.truth_data.sqrtpsinorm[i_n_peak_global]
+        
+        # For total impurity content inside the LCFS:
+        volnorm_grid = self.run.efit_tree.psinorm2volnorm(
+            self.run.truth_data.sqrtpsinorm**2.0,
+            (self.run.time_1 + self.run.time_2) / 2.0
+        )
+        V = self.run.efit_tree.psinorm2v(1.0, (self.run.time_1 + self.run.time_2) / 2.0)
+        mask = ~scipy.isnan(volnorm_grid)
+        volnorm_grid = volnorm_grid[mask]
+        nn = n[:, mask]
+        # Use the trapezoid rule:
+        N = V * 0.5 * ((volnorm_grid[1:] - volnorm_grid[:-1]) * (nn[:, 1:] + nn[:, :-1])).sum(axis=1)
+        i_N_peak = N.argmax()
+        res.t_N_peak = self.run.truth_data.time[i_N_peak]
+        res.N_peak = N[i_N_peak]
+        
+        # Confinement time for each charge state and each location:
+        res.tau_cs_den_local = scipy.zeros(cs_den.shape[1:3])
+        for s_idx in range(0, cs_den.shape[2]):
+            for cs_idx in range(0, cs_den.shape[1]):
+                t_mask = (self.run.truth_data.time > res.t_cs_den_peak_local[cs_idx, s_idx] + 0.01) & (cs_den[:, cs_idx, s_idx] > 0.0) & (~scipy.isinf(cs_den[:, cs_idx, s_idx])) & (~scipy.isnan(cs_den[:, cs_idx, s_idx]))
+                if t_mask.sum() < 2:
+                    res.tau_cs_den_local[cs_idx, s_idx] = 0.0
+                else:
+                    X = scipy.hstack((scipy.ones((t_mask.sum(), 1)), scipy.atleast_2d(self.run.truth_data.time[t_mask]).T))
+                    theta, dum1, dum2, dum3 = scipy.linalg.lstsq(X.T.dot(X), X.T.dot(scipy.log(cs_den[t_mask, cs_idx, s_idx])))
+                    res.tau_cs_den_local[cs_idx, s_idx] = -1.0 / theta[1]
+        
+        # Confinement time for total impurity density at each location:
+        res.tau_n_local = scipy.zeros(cs_den.shape[2])
+        for s_idx in range(0, n.shape[-1]):
+            t_mask = (self.run.truth_data.time > res.t_n_peak_local[s_idx] + 0.01) & (n[:, s_idx] > 0.0) & (~scipy.isinf(n[:, s_idx])) & (~scipy.isnan(n[:, s_idx]))
+            if t_mask.sum() < 2:
+                res.tau_n_local[s_idx] = 0.0
+            else:
+                X = scipy.hstack((scipy.ones((t_mask.sum(), 1)), scipy.atleast_2d(self.run.truth_data.time[t_mask]).T))
+                theta, dum1, dum2, dum3 = scipy.linalg.lstsq(X.T.dot(X), X.T.dot(scipy.log(n[t_mask, s_idx])))
+                res.tau_n_local[s_idx] = -1.0 / theta[1]
+        
+        # Confinement time of total impurity content:
+        t_mask = (self.run.truth_data.time > res.t_N_peak + 0.01) & (N > 0.0) & (~scipy.isinf(N)) & (~scipy.isnan(N))
+        if t_mask.sum() < 2:
+            res.tau_N = 0.0
+        else:
+            X = scipy.hstack((scipy.ones((t_mask.sum(), 1)), scipy.atleast_2d(self.run.truth_data.time[t_mask]).T))
+            theta, dum1, dum2, dum3 = scipy.linalg.lstsq(X.T.dot(X), X.T.dot(scipy.log(N[t_mask])))
+            res.tau_N = -1.0 / theta[1]
+        
+        return res
 
 class _OptimizeEval(object):
     """Wrapper class to allow parallel execution of random starts when optimizing the parameters.
