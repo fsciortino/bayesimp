@@ -381,8 +381,7 @@ class Run(object):
     time_2 : float
         The end time of the simulation.
     injections : list of :py:class:`Injection`
-        Skeleton objects describing the injections. These will be filled in as
-        part of building the object.
+        Objects describing the injections.
     tht : int
         The THT to use. Default is 0.
     line : int
@@ -398,67 +397,40 @@ class Run(object):
         Set to 0 to suppress superfluous plots. Set to 1 to enable some plots.
         Set to 2 to enable all plots. Default is 0.
     num_eig_D : int
-        The number of eigenvalues/free parameters to use for the D profile.
+        The number of eigenvalues/free coefficients to use for the D profile.
     num_eig_V : int
-        The number of eigenvalues/free parameters to use for the V profile.
-    D_hyperprior : :py:class:`gptools.JointPrior` instance
-        The hyperprior to use for the hyperparameters of the D profile. Note
-        that this will override the existing hyperprior of `k_D`.
-    V_hyperprior : :py:class:`gptools.JointPrior` instance
-        The hyperprior to use for the hyperparameters of the V profile. Note
-        that this will override the existing hyperprior of `k_V`.
-    k_D : :py:class:`gptools.Kernel` instance
-        The covariance kernel to use for the D profile. Default is to use a
-        squared exponential (SE) kernel.
-    k_V : :py:class:`gptools.Kernel` instance
-        The covariance kernel to use for the V profile. Default is to use a
-        squared exponential (SE) kernel.
-    mu_D : :py:class:`gptools.MeanFunction`
-        The mean function to use for the D profile. Default is to use a constant
-        mean function for which the value is selected during the inference.
-    clusters : bool
-        Whether or not the flat "cluster" region should be included in the
-        source model.
+        The number of eigenvalues/free coefficients to use for the V profile.
     roa_grid : array of float
         r/a grid to evaluate the ne, Te profiles on.
     roa_grid_DV : array of float
         r/a grid to evaluate the D, V profiles on.
-    source_prior : :py:class:`gptools.JointPrior` instance
-        The prior distribution for the parameters of the model source function.
-    nt_source : int
-        The number of time steps to evaluate the source function at.
     source_file : str
         If present, this is a path to a properly-formatted source file to use
         instead of the source model. This overrides the other options related
         to sources (though note that source_prior still acts as the prior for
         the temporal shift applied to the data, and hence should be univariate).
-    method : {'GP', 'spline', 'linterp'}
+    method : {'linterp', 'spline'}
         The method to use when evaluating the D, V profiles.
         
-            * If 'GP', a Gaussian process prior will be used for the V profile
-              and the logarithm of the D profile. `num_eig_D` and `num_eig_V`
-              will be the number of terms kept in a truncated Karhunen-Loeve
-              expansion of the GP prior.
-            * If 'spline', B-splines will be used for the D and V profiles.
-              `num_eig_D` and `num_eig_V` will then be the number of free
-              coefficients in the respective splines. Because there is a slope
-              constraint on D and a value constraint on V, this is one fewer
-              than the actual number of spline coefficients. The number of knots
-              is then num_eig - k + 2.
-            * If 'linterp', piecewise linear functions will be used for the D
-              and V profiles. `num_eig_D` and `num_eig_V` will then be the
-              number of free values which are then linearly-interpolated.
-              Because there is a slope constraint on D and a value constraint on
-              V, the number of knots is num_eig + 1.
+        * If 'linterp', (the default) piecewise linear functions will be used
+          for the D and V profiles. `num_eig_D` and `num_eig_V` will then be the
+          number of free values which are then linearly-interpolated. Because
+          there is a slope constraint on D and a value constraint on V, the
+          total number of knots is `num_eig + 1`. But the first and last knots
+          should usually be at the edges of the domain, so there are only
+          `num_eig - 1` free knots.
+        * If 'spline', B-splines will be used for the D and V profiles.
+          `num_eig_D` and `num_eig_V` will then be the number of free
+          coefficients in the respective splines. Because there is a slope
+          constraint on D and a value constraint on V, this is one fewer than
+          the actual number of spline coefficients. The total number of knots is
+          then `num_eig - k + 2`, or `num_eig - k` free knots.
         
-    knotgrid_D : array of float
-        The (fixed) knots to use for the D profile.
-    knotgrid_V : array of float
-        The (fixed) knots to use for the V profile.
     free_knots : bool
         If True, the (internal) knot locations will be taken to be free
         parameters included in the inference. There will always be a knot at 0
-        and a knot at 1. Default is to use fixed knots.
+        and a knot at 1. Default is to use fixed knots. This does not have an
+        effect if `fixed_params` is provided.
     spline_k_D : int
         The spline order to use for the D profile with method = 'spline'.
         Default is 3 (cubic spline).
@@ -475,11 +447,17 @@ class Run(object):
         included as a free parameter. This can help deal with issues in the
         normalization. Note that the signals are still normalized, so this
         factor should end up being very close to unity for each signal. Default
-        is False (only normalize).
+        is False (only normalize). This does not have an effect if `fixed_params`
+        is provided.
+    use_shift : bool
+        If True, a temporal shift applied to each diagnostic will be included as
+        a free parameter. This can help deal with issues of synchronization.
+        Default is False (do not shift). This does not have an effect if
+        `fixed_params` is provided.
     sort_knots : bool
         If True, the knots will be sorted when splitting the params. Default is
         False (don't sort knots, unsorted knots are treated as infeasible cases).
-    params_true : array of float, optional
+    params_true : array of float, (`num_params`,), optional
         If provided, these are used to construct synthetic data (using the
         equilibrium and temperature/density profiles from the specified shot).
         Default is to use actual experimental data.
@@ -510,6 +488,14 @@ class Run(object):
     time_spec : str, optional
         The time grid specification to use when writing the param file. Default
         is `DEFAULT_TIME_SPEC`.
+    fixed_params : array of bool, (`num_params`,), optional
+        An array with True wherever a parameter should be held fixed. Default is
+        for all parameters to be free.
+    initial_params : array of bool, (`num_params`,), optional
+        Initial values for all of the parameters (both free and fixed). Default
+        is to use `params_true` if it is provided, or a random draw from the
+        prior distribution. This exists primarily as a mechanism to set the
+        values of fixed parameters.
     """
     def __init__(
             self,
@@ -525,25 +511,16 @@ class Run(object):
             debug_plots=0,
             num_eig_D=5,
             num_eig_V=5,
-            D_hyperprior=None,
-            V_hyperprior=None,
-            k_D=None,
-            k_V=None,
-            mu_D=None,
-            clusters=False,
             roa_grid=scipy.linspace(0, 1.2, 100),
             roa_grid_DV=scipy.linspace(0, 1.05, 100),
-            source_prior=None,
-            nt_source=200,
             source_file=None,
-            method='GP',
-            knotgrid_D=None,
-            knotgrid_V=None,
+            method='linterp',
             free_knots=False,
             spline_k_D=3,
             spline_k_V=3,
             include_loweus=False,
             use_scaling=False,
+            use_shift=False,
             sort_knots=False,
             params_true=None,
             synth_li_lines=[0, 3, 5, 2, 12, 8, 6],
@@ -551,10 +528,26 @@ class Run(object):
             hirex_time_res=1e-3,
             vuv_time_res=1e-3,
             xtomo_time_res=2e-6,
+            local_time_res=1e-4,
+            num_local_space=20,
+            local_cs=[None,],
             presampling_time=15e-3,
             synth_noises=[0.03, 0.03, 0.1],
+            local_synth_noise=5e-3,
             normalize=True,
-            time_spec=DEFAULT_TIME_SPEC
+            time_spec=DEFAULT_TIME_SPEC,
+            fixed_params=None,
+            initial_params=None,
+            D_lb=0.0,
+            D_ub=30.0,
+            V_lb=-100.0,
+            V_ub=50.0,
+            V_lb_outer=-200.0,
+            V_ub_outer=0.0,
+            num_eig_ne=5,
+            num_eig_Te=3,
+            free_ne=False,
+            free_Te=False
         ):
         
         global MASTER_DIR
@@ -562,75 +555,52 @@ class Run(object):
         self._ll_normalization = None
         self._ar_ll_normalization = None
         
-        self.shot = shot
-        self.version = version
-        self.time_1 = time_1
-        self.time_2 = time_2
+        self.shot = int(shot)
+        self.version = int(version)
+        self.time_1 = float(time_1)
+        self.time_2 = float(time_2)
         self.time_spec = time_spec.format(time_1=time_1, time_2=time_2)
         self.injections = injections
-        self.tht = tht
-        self.line = line
-        # self.Te_args = Te_args
-        # self.ne_args = ne_args
-        self.debug_plots = debug_plots
+        self.tht = int(tht)
+        self.line = int(line)
+        self.debug_plots = bool(debug_plots)
+        self.include_loweus = bool(include_loweus)
+        self.normalize = bool(normalize)
+        self.params_true = scipy.asarray(params_true, dtype=float)
+        self.sort_knots = bool(sort_knots)
         
-        self.include_loweus = include_loweus
+        self.D_lb = float(D_lb)
+        self.D_ub = float(D_ub)
+        self.V_lb = float(V_lb)
+        self.V_ub = float(V_ub)
+        self.V_lb_outer = float(V_lb_outer)
+        self.V_ub_outer = float(V_ub_outer)
         
-        self.free_knots = free_knots
-        self.sort_knots = sort_knots
-        
-        self.use_scaling = use_scaling
-        self.normalize = normalize
-        
-        self.params_true = params_true
+        self.num_eig_ne = num_eig_ne
+        self.num_eig_Te = num_eig_Te
         
         if method == 'spline':
-            self.spline_k_D = spline_k_D
-            self.spline_k_V = spline_k_V
+            self.spline_k_D = int(spline_k_D)
+            self.spline_k_V = int(spline_k_V)
+        elif method == 'linterp':
+            self.spline_k_D = 1
+            self.spline_k_V = 1
+        else:
+            raise ValueError("Unknown method: %s" % (method,))
         
-        self.method = method
-        if not self.free_knots:
-            if self.method == 'spline':
-                if knotgrid_D is None:
-                    knotgrid_D = scipy.linspace(0, roa_grid_DV[-1], num_eig_D - self.spline_k_D + 2)
-                if knotgrid_V is None:
-                    knotgrid_V = scipy.linspace(0, roa_grid_DV[-1], num_eig_V - self.spline_k_D + 2)
-            elif self.method == 'linterp':
-                if knotgrid_D is None:
-                    knotgrid_D = scipy.linspace(0, roa_grid_DV[-1], num_eig_D + 1)
-                if knotgrid_V is None:
-                    knotgrid_V = scipy.linspace(0, roa_grid_DV[-1], num_eig_V + 1)
-            
-            self.knotgrid_D = knotgrid_D
-            self.knotgrid_V = knotgrid_V
+        self.method = str(method)
         
-        self.num_eig_D = num_eig_D
-        self.num_eig_V = num_eig_V
-        if self.method == 'GP':
-            if k_D is None:
-                k_D = gptools.SquaredExponentialKernel()
-            if k_V is None:
-                k_V = gptools.SquaredExponentialKernel()
-            if D_hyperprior is None:
-                D_hyperprior = k_D.hyperprior
-            else:
-                k_D.hyperprior = D_hyperprior
-            if V_hyperprior is None:
-                V_hyperprior = k_V.hyperprior
-            else:
-                k_V.hyperprior = V_hyperprior
-            self.D_hyperprior = D_hyperprior
-            self.V_hyperprior = V_hyperprior
-            self.k_D = k_D
-            self.mu_D = mu_D
-            self.k_V = k_V
+        if num_eig_D < 1:
+            raise ValueError("Must have at least one free coefficient for D!")
+        if num_eig_V < 1:
+            raise ValueError("Must have at least one free coefficient for V!")
         
-        self.source_file = source_file
-        if source_file is None:
-            self.clusters = clusters
-            self.nt_source = nt_source
-        self.roa_grid = roa_grid
-        self.roa_grid_DV = roa_grid_DV
+        self.num_eig_D = int(num_eig_D)
+        self.num_eig_V = int(num_eig_V)
+        
+        self.source_file = str(source_file)
+        self.roa_grid = scipy.asarray(roa_grid, dtype=float)
+        self.roa_grid_DV = scipy.asarray(roa_grid_DV, dtype=float)
         # Convert the psinorm grids to r/a:
         self.efit_tree = eqtools.CModEFITTree(self.shot)
         self.psinorm_grid = self.efit_tree.roa2psinorm(
@@ -646,14 +616,6 @@ class Run(object):
         )
         # In case there is a NaN:
         self.psinorm_grid_DV[0] = 0.0
-        
-        if source_prior is None:
-            if source_file is not None:
-                # Offsets for HiReX, XEUS/LoWEUS and XTOMO.
-                source_prior = gptools.NormalJointPrior([0, 0, 0], [2e-3, 2e-3, 2e-3])
-            else:
-                raise NotImplementedError("Explicit source file must be provided!")
-        self.source_prior = source_prior
         
         # If a STRAHL directory doesn't exist yet, create one and set it up:
         current_dir = os.getcwd()
@@ -707,6 +669,8 @@ class Run(object):
                 self.signals = pkl.load(f)
             with open('ar_signal.pkl', 'rb') as f:
                 self.ar_signal = pkl.load(f)
+            with open('local_signals.pkl', 'rb') as f:
+                self.local_signals = pkl.load(f)
             if os.path.isfile('truth_data.pkl'):
                 with open('truth_data.pkl', 'rb') as f:
                     self.truth_data = pkl.load(f)
@@ -714,6 +678,7 @@ class Run(object):
         except IOError:
             if self.params_true is None:
                 self.signals = []
+                self.local_signals = []
                 hirex_data = HirexData(self.injections, debug_plots=self.debug_plots)
                 self.signals.append(hirex_data.signal)
                 vuv_data = VUVData(self.shot, self.injections, debug_plots=self.debug_plots)
@@ -729,6 +694,11 @@ class Run(object):
                 # Read it back in to ensure consistency:
                 self.atomdat = read_atomdat('Ca.atomdat')
                 
+                # Need to put dummy values in for this to work:
+                # The prior won't work until the signals are created, so this
+                # must be done here.
+                self.params = self.get_prior().random_draw()
+                self.fixed_params = scipy.zeros_like(self.params, dtype=bool)
                 self.compute_view_data()
             else:
                 # Generate the synthetic data:
@@ -745,6 +715,24 @@ class Run(object):
                 
                 # Make placeholders for the signals:
                 self.signals = []
+                self.local_signals = []
+                
+                # Local:
+                npts = int(scipy.ceil((self.time_2 - self.time_1 + presampling_time) / local_time_res))
+                t = scipy.linspace(-presampling_time, -presampling_time + local_time_res * (npts - 1), npts)
+                sqrtpsinorm = scipy.linspace(0, 1, num_local_space)
+                for idx in local_cs:
+                    self.local_signals.append(
+                        LocalSignal(
+                            scipy.zeros((len(t), len(sqrtpsinorm))),
+                            scipy.zeros((len(t), len(sqrtpsinorm))),
+                            scipy.zeros((len(t), len(sqrtpsinorm))),
+                            scipy.zeros((len(t), len(sqrtpsinorm))),
+                            t,
+                            sqrtpsinorm,
+                            idx
+                        )
+                    )
                 
                 # HiReX-SR:
                 npts = int(scipy.ceil((self.time_2 - self.time_1 + presampling_time) / hirex_time_res))
@@ -809,6 +797,10 @@ class Run(object):
                 self.signals[-1].weight_idxs = scipy.hstack((range(0, 38), range(0, 38)))
                 
                 # Compute the view data:
+                # The prior won't work until the signals are created, so this
+                # must be done here.
+                self.params = params_true
+                self.fixed_params = scipy.zeros_like(self.params, dtype=bool)
                 self.compute_view_data()
                 
                 # Temporarily override normalization so we can get the absolute
@@ -818,27 +810,27 @@ class Run(object):
                 
                 # First for (time-dependent) CaF2:
                 cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(self.params_true, debug_plots=debug_plots)
-                dlines = self.cs_den2dlines(self.params_true, cs_den, sqrtpsinorm, time, ne, Te, debug_plots=debug_plots)
-                sig_abs = self.dlines2sig(self.params_true, dlines, time, debug_plots=debug_plots)
+                dlines = self.cs_den2dlines(cs_den, sqrtpsinorm, time, ne, Te, debug_plots=debug_plots)
+                sig_abs = self.dlines2sig(dlines, time, debug_plots=debug_plots)
                 for s, ss in zip(sig_abs, self.signals):
                     ss.y = s
                 
                 # Now for Ar:
                 cs_den_ar, sqrtpsinorm, time_ar, ne, Te = self.DV2cs_den(self.params_true, debug_plots=debug_plots, steady_ar=1e15)
-                dlines_ar = self.cs_den2dlines(self.params_true, cs_den_ar, sqrtpsinorm, time_ar, ne, Te, debug_plots=debug_plots, steady_ar=1e15)
-                sig_abs_ar = self.dlines2sig(self.params_true, dlines_ar, time_ar, debug_plots=debug_plots, steady_ar=1e15)
+                dlines_ar = self.cs_den2dlines(cs_den_ar, sqrtpsinorm, time_ar, ne, Te, debug_plots=debug_plots, steady_ar=1e15)
+                sig_abs_ar = self.dlines2sig(dlines_ar, time_ar, debug_plots=debug_plots, steady_ar=1e15)
                 self.ar_signal.y[:, :] = sig_abs_ar
                 
                 # Now, normalized:
                 self.normalize = True
                 
                 # First for (time-dependent) CaF2:
-                sig_norm = self.dlines2sig(self.params_true, dlines, time, debug_plots=debug_plots)
+                sig_norm = self.dlines2sig(dlines, time, debug_plots=debug_plots)
                 for s, ss in zip(sig_norm, self.signals):
                     ss.y_norm = s
                 
                 # Now for Ar:
-                sig_norm_ar = self.dlines2sig(self.params_true, dlines_ar, time_ar, debug_plots=debug_plots, steady_ar=1e15)
+                sig_norm_ar = self.dlines2sig(dlines_ar, time_ar, debug_plots=debug_plots, steady_ar=1e15)
                 self.ar_signal.y_norm[:, :] = sig_norm_ar
                 
                 # Now set it back:
@@ -863,19 +855,346 @@ class Run(object):
                     pkl.dump(self.truth_data, f, protocol=pkl.HIGHEST_PROTOCOL)
                 
                 # Apply noise:
-                self.apply_noise(noises=synth_noises)
+                self.apply_noise(noises=synth_noises, local_noise=local_synth_noise)
             
             with open('signals.pkl', 'wb') as f:
                 pkl.dump(self.signals, f, protocol=pkl.HIGHEST_PROTOCOL)
             with open('ar_signal.pkl', 'wb') as f:
                 pkl.dump(self.ar_signal, f, protocol=pkl.HIGHEST_PROTOCOL)
+            with open('local_signals.pkl', 'wb') as f:
+                pkl.dump(self.local_signals, f, protocol=pkl.HIGHEST_PROTOCOL)
         
         # Sort the time axes:
         for s in self.signals:
             s.sort_t()
         self.ar_signal.sort_t()
+        
+        # Handle the initial params:
+        if initial_params is not None:
+            self.params = scipy.asarray(initial_params, dtype=float)
+        elif params_true is not None:
+            self.params = self.params_true
+        else:
+            self.params = self.get_prior().random_draw()
+        
+        # Handle the fixed params:
+        if fixed_params is not None:
+            self.fixed_params = scipy.asarray(fixed_params, dtype=bool)
+        else:
+            self.fixed_params = scipy.zeros_like(self.params, dtype=bool)
+            # Set these here:
+            self.free_knots = free_knots
+            self.use_scaling = use_scaling
+            self.use_shift = use_shift
+            self.free_ne = free_ne
+            self.free_Te = free_Te
     
-    def apply_noise(self, noises=[0.03, 0.03, 0.1]):
+    @property
+    def num_params(self):
+        return len(self.fixed_params)
+    
+    @property
+    def param_bounds(self):
+        return self.get_prior().bounds
+    
+    @param_bounds.setter
+    def param_bounds(self, value):
+        self.get_prior().bounds = value
+    
+    @property
+    def num_free_params(self):
+        """Returns the number of free parameters.
+        """
+        return sum(~self.fixed_params)
+    
+    @property
+    def free_param_idxs(self):
+        """Returns the indices of the free parameters in the main arrays of parameters, etc.
+        """
+        return scipy.arange(0, self.num_params)[~self.fixed_params]
+    
+    @property
+    def free_params(self):
+        """Returns the values of the free parameters.
+        
+        Returns
+        -------
+        free_params : :py:class:`Array`
+            Array of the free parameters, in order.
+        """
+        return gptools.MaskedBounds(self.params, self.free_param_idxs)
+    
+    @free_params.setter
+    def free_params(self, value):
+        self.params[self.free_param_idxs] = scipy.asarray(value, dtype=float)
+    
+    @property
+    def free_param_bounds(self):
+        """Returns the bounds of the free parameters.
+        
+        Returns
+        -------
+        free_param_bounds : :py:class:`Array`
+            Array of the bounds of the free parameters, in order.
+        """
+        return gptools.MaskedBounds(self.get_prior().bounds, self.free_param_idxs)
+    
+    @free_param_bounds.setter
+    def free_param_bounds(self, value):
+        # Need to use a loop since self.get_prior().bounds is NOT guaranteed to support fancy indexing.
+        p = self.get_prior()
+        for i, v in zip(self.free_param_idxs, value):
+            self.p.bounds[i] = v
+    
+    @property
+    def free_param_names(self):
+        """Returns the names of the free parameters.
+        
+        Returns
+        -------
+        free_param_names : :py:class:`Array`
+            Array of the names of the free parameters, in order.
+        """
+        return gptools.MaskedBounds(self.param_names, self.free_param_idxs)
+    
+    # @free_param_names.setter
+    # def free_param_names(self, value):
+    #     # Cast to array in case it hasn't been done already:
+    #     self.param_names = scipy.asarray(self.param_names, dtype=str)
+    #     self.param_names[~self.fixed_params] = value
+    
+    @property
+    def param_names(self):
+        return scipy.asarray(self.get_labels(), dtype=str)
+    
+    @property
+    def free_knots(self):
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        return (~self.fixed_params[nD + nV:nD + nV + nkD + nkV]).any()
+    
+    @free_knots.setter
+    def free_knots(self, val):
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        self.fixed_params[nD + nV:nD + nV + nkD + nkV] = not val
+    
+    @property
+    def use_scaling(self):
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        # # Number of diagnostics (determines number of time shifts):
+        # nDiag = len(self.signals)
+        
+        return (~self.fixed_params[nD + nV + nkD + nkV:nD + nV + nkD + nkV + nS]).any()
+        
+        # Split up:
+        # eig_D = params[:nD]
+        # eig_V = params[nD:nD + nV]
+        # knots_D = params[nD + nV:nD + nV + nkD]
+        # knots_V = params[nD + nV + nkD:nD + nV + nkD + nkV]
+        param_scaling = params[nD + nV + nkD + nkV:nD + nV + nkD + nkV + nS]
+        # param_source = params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag]
+    
+    @use_scaling.setter
+    def use_scaling(self, val):
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        self.fixed_params[nD + nV + nkD + nkV:nD + nV + nkD + nkV + nS] = not val
+    
+    @property
+    def use_shift(self):
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        # Number of diagnostics (determines number of time shifts):
+        nDiag = len(self.signals)
+        
+        return (~self.fixed_params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag]).any()
+    
+    @use_shift.setter
+    def use_shift(self, val):
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        # Number of diagnostics (determines number of time shifts):
+        nDiag = len(self.signals)
+        
+        self.fixed_params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag] = not val
+    
+    @property
+    def free_ne(self):
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        # Number of diagnostics (determines number of time shifts):
+        nDiag = len(self.signals)
+        
+        return (
+            ~self.fixed_params[
+                nD + nV + nkD + nkV + nS + nDiag:
+                nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne
+            ]
+        ).any()
+    
+    @free_ne.setter
+    def free_ne(self, val):
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        # Number of diagnostics (determines number of time shifts):
+        nDiag = len(self.signals)
+        
+        self.fixed_params[
+            nD + nV + nkD + nkV + nS + nDiag:
+            nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne
+        ] = not val
+    
+    @property
+    def free_Te(self):
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        # Number of diagnostics (determines number of time shifts):
+        nDiag = len(self.signals)
+        
+        return (
+            ~self.fixed_params[
+                nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne:
+                nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne + self.num_eig_Te
+            ]
+        ).any()
+    
+    @free_Te.setter
+    def free_Te(self, val):
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        # Number of diagnostics (determines number of time shifts):
+        nDiag = len(self.signals)
+        
+        self.fixed_params[
+            nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne:
+            nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne + self.num_eig_Te
+        ] = not val
+    
+    @property
+    def knotgrid_D(self):
+        """Grid of knots to use when evaluating the D profile.
+        
+        Takes the (internal) knots given in :py:attr:`self.params` and puts the
+        boundary knots given by the extreme values of :py:attr:`self.roa_grid_DV`
+        at either end.
+        """
+        eig_D, eig_V, knots_D, knots_V, param_scaling, param_source, eig_ne, eig_Te = self.split_params()
+        return scipy.concatenate(([self.roa_grid_DV[0],], knots_D, [self.roa_grid_DV[-1],]))
+    
+    @property
+    def knotgrid_V(self):
+        """Grid of knots to use when evaluating the V profile.
+        
+        Takes the (internal) knots given in :py:attr:`self.params` and puts the
+        boundary knots given by the extreme values of :py:attr:`self.roa_grid_DV`
+        at either end.
+        """
+        eig_D, eig_V, knots_D, knots_V, param_scaling, param_source, eig_ne, eig_Te = self.split_params()
+        return scipy.concatenate(([self.roa_grid_DV[0],], knots_V, [self.roa_grid_DV[-1],]))
+    
+    def apply_noise(self, noises=[0.03, 0.03, 0.1], local_noise=5e-3):
         """Apply random noise to the data.
         
         Parameters
@@ -887,23 +1206,58 @@ class Run(object):
         """
         for i, (n, s) in enumerate(zip(noises, self.signals)):
             s.y = self.truth_data.sig_abs[i] * (1.0 + n * scipy.randn(*self.truth_data.sig_abs[i].shape))
+            s.y[s.y < 0.0] = 0.0
             s.std_y = n * self.truth_data.sig_abs[i]
-            s.std_y[s.std_y == 0] = n * self.truth_data.sig_abs[i][self.truth_data.sig_abs[i] > 0.0].min()
+            s.std_y[s.std_y < 1e-4 * s.y.max()] = 1e-4 * s.y.max()
             
             s.y_norm = self.truth_data.sig_norm[i] * (1.0 + n * scipy.randn(*self.truth_data.sig_norm[i].shape))
+            s.y_norm[s.y < 0.0] = 0.0
             s.std_y_norm = n * self.truth_data.sig_norm[i]
-            s.std_y_norm[s.std_y_norm == 0] = n * self.truth_data.sig_norm[i][self.truth_data.sig_norm[i] > 0.0].min()
+            s.std_y_norm[s.std_y_norm < 1e-4 * s.y_norm.max()] = 1e-4 * s.y_norm.max()
+        
+        n = local_noise
+        for sls in self.local_signals:
+            if sls.cs_den_idx is None:
+                spl = scipy.interpolate.RectBivariateSpline(
+                    self.truth_data.time - self.time_1,
+                    self.truth_data.sqrtpsinorm,
+                    self.truth_data.cs_den.sum(axis=1)
+                )
+                cs_den_norm = self.truth_data.cs_den.sum(axis=1)
+            else:
+                spl = scipy.interpolate.RectBivariateSpline(
+                    self.truth_data.time - self.time_1,
+                    self.truth_data.sqrtpsinorm,
+                    self.truth_data.cs_den[:, sls.cs_den_idx, :]
+                )
+                cs_den_norm = self.truth_data.cs_den[:, sls.cs_den_idx, :]
+            
+            sls.y[:, :] = spl(sls.t, sls.sqrtpsinorm)
+            sls.std_y = n * sls.y
+            sls.y *= (1.0 + n * scipy.randn(*sls.y.shape))
+            sls.y[sls.y < 0.0] = 0.0
+            sls.std_y[sls.std_y < 1e-4 * sls.y.max()] = 1e-4 * sls.y.max()
+            
+            cs_den_norm = cs_den_norm / cs_den_norm.max()
+            spl = scipy.interpolate.RectBivariateSpline(self.truth_data.time - self.time_1, self.truth_data.sqrtpsinorm, cs_den_norm)
+            sls.y_norm[:, :] = spl(sls.t, sls.sqrtpsinorm)
+            sls.std_y_norm = n * sls.y_norm
+            sls.y_norm *= (1.0 + n * scipy.randn(*sls.y_norm.shape))
+            sls.y_norm[sls.y_norm < 0.0] = 0.0
+            sls.std_y_norm[sls.std_y_norm < 1e-4 * sls.y_norm.max()] = 1e-4 * sls.y_norm.max()
         
         # Needs special handling since sig_*_ar just has a single timepoint:
         self.ar_signal.y[:, :] = self.truth_data.sig_abs_ar * (1.0 + noises[0] * scipy.randn(*self.ar_signal.y.shape))
+        self.ar_signal.y[self.ar_signal.y < 0.0] = 0.0
         self.ar_signal.std_y[:, :] = noises[0] * self.truth_data.sig_abs_ar
-        self.ar_signal.std_y[self.ar_signal.std_y == 0] = noises[0] * self.truth_data.sig_abs_ar[self.truth_data.sig_abs_ar[i] > 0.0].min()
+        self.ar_signal.std_y[self.ar_signal.std_y < 1e-4 * self.ar_signal.y.max()] = 1e-4 * self.ar_signal.y.max()
         
         self.ar_signal.y_norm[:, :] = self.truth_data.sig_norm_ar * (1.0 + noises[0] * scipy.randn(*self.ar_signal.y.shape))
+        self.ar_signal.y_norm[self.ar_signal.y_norm < 0.0] = 0.0
         self.ar_signal.std_y_norm[:, :] = noises[0] * self.truth_data.sig_norm_ar
-        self.ar_signal.std_y_norm[self.ar_signal.std_y_norm == 0] = noises[0] * self.truth_data.sig_norm_ar[self.truth_data.sig_norm_ar[i] > 0.0].min()
-    
-    def eval_DV(self, params, plot=False, lc=None, label=None):
+        self.ar_signal.std_y_norm[self.ar_signal.std_y_norm < 1e-4 * self.ar_signal.y_norm.max()] = 1e-4 * self.ar_signal.y_norm.max()
+        
+    def eval_DV(self, params=None, plot=False, lc=None, label=None):
         """Evaluate the D, V profiles for the given parameters.
         
         Parameters
@@ -913,27 +1267,19 @@ class Run(object):
         plot : bool, optional
             If True, a plot of D and V will be produced. Default is False.
         """
-        eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.split_params(params)
-        
-        if self.method == 'GP':
-            D = scipy.exp(
-                eval_profile(
-                    self.roa_grid_DV,
-                    self.k_D,
-                    eig_D,
-                    1,
-                    params=scipy.concatenate((hp_D, hp_mu_D)),
-                    mu=self.mu_D
-                )
-            )
-            V = eval_profile(self.roa_grid_DV, self.k_V, eig_V, 0, params=hp_V)
-        elif self.method == 'spline':
-            if self.free_knots:
-                knotgrid_D = scipy.concatenate(([self.roa_grid_DV.min()], knots_D, [self.roa_grid_DV.max()]))
-                knotgrid_V = scipy.concatenate(([self.roa_grid_DV.min()], knots_V, [self.roa_grid_DV.max()]))
+        if params is not None:
+            params = scipy.asarray(params, dtype=float)
+            if len(params) == self.num_params:
+                self.params = params
             else:
-                knotgrid_D = self.knotgrid_D
-                knotgrid_V = self.knotgrid_V
+                self.free_params = params
+        
+        eig_D, eig_V, knots_D, knots_V, param_scaling, param_source, eig_ne, eig_Te = self.split_params()
+        
+        knotgrid_D = self.knotgrid_D
+        knotgrid_V = self.knotgrid_V
+        
+        if self.method == 'spline':
             D = spev(
                 knotgrid_D,
                 scipy.insert(eig_D, 0, eig_D[0]),
@@ -949,12 +1295,6 @@ class Run(object):
                 self.roa_grid_DV
             )
         elif self.method == 'linterp':
-            if self.free_knots:
-                knotgrid_D = scipy.concatenate(([self.roa_grid_DV.min()], knots_D, [self.roa_grid_DV.max()]))
-                knotgrid_V = scipy.concatenate(([self.roa_grid_DV.min()], knots_V, [self.roa_grid_DV.max()]))
-            else:
-                knotgrid_D = self.knotgrid_D
-                knotgrid_V = self.knotgrid_V
             D = scipy.interpolate.InterpolatedUnivariateSpline(
                 knotgrid_D,
                 scipy.insert(eig_D, 0, eig_D[0]),
@@ -966,7 +1306,7 @@ class Run(object):
                 k=1
             )(self.roa_grid_DV)
         else:
-            raise ValueError("Illegal method '%s'!" % (self.method,))
+            raise ValueError("Unknown method '%s'!" % (self.method,))
         
         if plot:
             f = plt.figure()
@@ -1040,164 +1380,78 @@ class Run(object):
         
         return mu_D, std_D, mu_V, std_V
     
-    def split_params(self, params):
+    def split_params(self, params=None):
         """Split the given param vector into its constituent parts.
+        
+        Any parameters which are infinite are set to `1e-100 * sys.float_info.max`.
+        
+        The parts are, in order:
+        
+        1. Coefficients for the D profile.
+        2. Coefficients for the V profile.
+        3. Knot locations for the D profile.
+        4. Knot locations for the V profile.
+        5. Scaling parameters for the signals.
+        6. Time shift parameters for the diagnostics.
+        7. Eigenvalues for the ne profile.
+        8. Eigenvalues for the Te profile.
+        
+        Parameters
+        ----------
+        params : array of float, (`num_params`,), optional
+            The parameter vector to split. If not provided,
+            :py:attr:`self.params` is used. This vector should contain all of
+            the parameters, not just the free parameters.
+        
+        Returns
+        -------
+        split_params : tuple
+            Tuple of arrays of params, split as described above.
         """
-        params = scipy.asarray(params, dtype=float)
+        if params is None:
+            params = self.params
+        else:
+            params = scipy.asarray(params, dtype=float)
         
         # Try to avoid some stupid issues:
         params[params == scipy.inf] = 1e-100 * sys.float_info.max
         params[params == -scipy.inf] = -1e-100 * sys.float_info.max
         
-        # Split up the params:
-        eig_D = params[:self.num_eig_D]
-        eig_V = params[self.num_eig_D:self.num_eig_D + self.num_eig_V]
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
         
-        if self.method == 'GP':
-            eig_D = scipy.atleast_2d(eig_D).T
-            eig_V = scipy.atleast_2d(eig_V).T
-            hp_D = params[
-                self.num_eig_D + self.num_eig_V:
-                self.num_eig_D + self.num_eig_V + self.k_D.num_free_params
-            ]
-            hp_mu_D = params[
-                self.num_eig_D + self.num_eig_V + self.k_D.num_free_params:
-                self.num_eig_D + self.num_eig_V + self.k_D.num_free_params +
-                    self.mu_D.num_free_params
-            ]
-            hp_V = params[
-                self.num_eig_D + self.num_eig_V + self.k_D.num_free_params +
-                    self.mu_D.num_free_params:
-                self.num_eig_D + self.num_eig_V + self.k_D.num_free_params +
-                    self.mu_D.num_free_params + self.k_V.num_free_params
-            ]
-            if self.use_scaling:
-                param_scaling = params[
-                    self.num_eig_D + self.num_eig_V + self.k_D.num_free_params +
-                        self.mu_D.num_free_params + self.k_V.num_free_params:
-                    self.num_eig_D + self.num_eig_V + self.k_D.num_free_params +
-                        self.mu_D.num_free_params + self.k_V.num_free_params +
-                        1 + self.signals[1].y.shape[1] +
-                        len(
-                            [k for k in (1, 3)]
-                        )
-                ]
-                param_source = params[
-                    self.num_eig_D + self.num_eig_V + self.k_D.num_free_params +
-                        self.mu_D.num_free_params + self.k_V.num_free_params +
-                        1 + self.signals[1].y.shape[1] +
-                        len(
-                            [k for k in (1, 3)]
-                        ):
-                ]
-            else:
-                param_scaling = []
-                param_source = params[
-                    self.num_eig_D + self.num_eig_V + self.k_D.num_free_params +
-                        self.mu_D.num_free_params + self.k_V.num_free_params:
-                ]
-        else:
-            hp_D = []
-            hp_mu_D = []
-            hp_V = []
-            if self.free_knots:
-                if self.method == 'spline':
-                    knots_D = params[
-                        self.num_eig_D + self.num_eig_V:
-                        self.num_eig_D + self.num_eig_V + self.num_eig_D -
-                            self.spline_k_D
-                    ]
-                    knots_V = params[
-                        self.num_eig_D + self.num_eig_V + self.num_eig_D -
-                            self.spline_k_D:
-                        self.num_eig_D + self.num_eig_V + self.num_eig_D -
-                            self.spline_k_D + self.num_eig_V - self.spline_k_V
-                    ]
-                    if self.use_scaling:
-                        param_scaling = params[
-                            self.num_eig_D + self.num_eig_V + self.num_eig_D -
-                                self.spline_k_D + self.num_eig_V - self.spline_k_V:
-                            self.num_eig_D + self.num_eig_V + self.num_eig_D -
-                                self.spline_k_D + self.num_eig_V - self.spline_k_V +
-                                1 + self.signals[1].y.shape[1] +
-                                len(
-                                    [k for k in (1, 3)]
-                                )
-                        ]
-                        param_source = params[
-                            self.num_eig_D + self.num_eig_V + self.num_eig_D -
-                                self.spline_k_D + self.num_eig_V - self.spline_k_V +
-                                1 + self.signals[1].y.shape[1] +
-                                len(
-                                    [k for k in (1, 3)]
-                                ):
-                        ]
-                    else:
-                        param_scaling = []
-                        param_source = params[
-                            self.num_eig_D + self.num_eig_V + self.num_eig_D -
-                                self.spline_k_D + self.num_eig_V - self.spline_k_V:
-                        ]
-                elif self.method == 'linterp':
-                    knots_D = params[
-                        self.num_eig_D + self.num_eig_V:
-                        self.num_eig_D + self.num_eig_V + self.num_eig_D - 1
-                    ]
-                    knots_V = params[
-                        self.num_eig_D + self.num_eig_V + self.num_eig_D - 1:
-                        self.num_eig_D + self.num_eig_V + self.num_eig_D - 1 +
-                            self.num_eig_V - 1
-                    ]
-                    if self.use_scaling:
-                        param_scaling = params[
-                            self.num_eig_D + self.num_eig_V + self.num_eig_D - 1 +
-                                self.num_eig_V - 1:
-                            self.num_eig_D + self.num_eig_V + self.num_eig_D - 1 +
-                                self.num_eig_V - 1 +
-                                1 + self.signals[1].y.shape[1] +
-                                len(
-                                    [k for k in (1, 3)]
-                                )
-                        ]
-                        param_source = params[
-                            self.num_eig_D + self.num_eig_V + self.num_eig_D - 1 +
-                                self.num_eig_V - 1 +
-                                1 + self.signals[1].y.shape[1] +
-                                len(
-                                    [k for k in (1, 3)]
-                                ):
-                        ]
-                    else:
-                        param_scaling = []
-                        param_source = params[
-                            self.num_eig_D + self.num_eig_V + self.num_eig_D - 1 +
-                                self.num_eig_V - 1:
-                        ]
-                if self.sort_knots:
-                    knots_D = scipy.sort(knots_D)
-                    knots_V = scipy.sort(knots_V)
-            else:
-                knots_D = []
-                knots_V = []
-                if self.use_scaling:
-                    param_scaling = params[
-                        self.num_eig_D + self.num_eig_V:
-                        self.num_eig_D + self.num_eig_V +
-                            1 + self.signals[1].y.shape[1] +
-                            len(
-                                [k for k in (1, 3)]
-                            )
-                    ]
-                    param_source = params[
-                        self.num_eig_D + self.num_eig_V +
-                            1 + self.signals[1].y.shape[1] +
-                            len(
-                                [k for k in (1, 3)]
-                            ):
-                    ]
-                else:
-                    param_scaling = []
-                    param_source = params[self.num_eig_D + self.num_eig_V:]
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        # Number of diagnostics (determines number of time shifts):
+        nDiag = len(self.signals)
+        
+        # Split up:
+        eig_D = params[:nD]
+        eig_V = params[nD:nD + nV]
+        knots_D = params[nD + nV:nD + nV + nkD]
+        knots_V = params[nD + nV + nkD:nD + nV + nkD + nkV]
+        param_scaling = params[nD + nV + nkD + nkV:nD + nV + nkD + nkV + nS]
+        param_source = params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag]
+        eig_ne = params[
+            nD + nV + nkD + nkV + nS + nDiag:
+            nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne
+        ]
+        eig_Te = params[
+            nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne:
+            nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne + self.num_eig_Te
+        ]
+        
+        if self.sort_knots:
+            knots_D = scipy.sort(knots_D)
+            knots_V = scipy.sort(knots_V)
         
         # Fudge the source times and scaling factors since this seems to go
         # crazy:
@@ -1206,7 +1460,7 @@ class Run(object):
         param_source[param_source > 1e3] = 1e3
         param_source[param_source < -1e3] = -1e3
         
-        return (eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source)
+        return eig_D, eig_V, knots_D, knots_V, param_scaling, param_source, eig_ne, eig_Te
     
     def get_prior(self):
         """Return the prior distribution.
@@ -1214,83 +1468,63 @@ class Run(object):
         This is a :py:class:`gptools.JointPrior` instance -- when called as a
         function, it returns the log-probability.
         """
-        D_lb = 0.0
-        D_ub = 30.0  # was 50
-        # D_ub = 50.0  # was 50
-        V_lb = -200.0
-        V_ub = 200.0
-        # V_ub_outer = 0.0
-        V_ub_outer = V_ub
-        V_lb_outer = -200.0
-        # V_lb_outer = -1000.0  # was -1000
-        # V_lb_outer = -500.0  # was -500
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
         
-        if self.method == 'GP':
-            prior = (
-                gptools.NormalJointPrior(
-                    [0.0] * (self.num_eig_D + self.num_eig_V),
-                    [1.0] * (self.num_eig_D + self.num_eig_V)
-                ) *
-                self.k_D.hyperprior *
-                self.mu_D.hyperprior *
-                self.k_V.hyperprior
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        # Number of diagnostics (determines number of time shifts):
+        nDiag = len(self.signals)
+        
+        # Coefficients:
+        prior = gptools.UniformJointPrior(
+            [(self.D_lb, self.D_ub)] * nD +
+            [(self.V_lb, self.V_ub)] * (nV - 1) +
+            [(self.V_lb_outer, self.V_ub_outer)]
+        )
+        # Knots:
+        if self.sort_knots:
+            prior = prior * gptools.UniformJointPrior(
+                [(self.roa_grid_DV.min(), self.roa_grid_DV.max())] * (nkD + nkV)
             )
         else:
-            prior = gptools.UniformJointPrior(
-                [(D_lb, D_ub)] * self.num_eig_D +
-                [(V_lb, V_ub)] * (self.num_eig_V - 1) +
-                [(V_lb_outer, V_ub_outer)]
-            )
-        if self.free_knots:
-            if self.method == 'spline':
-                k_D = self.spline_k_D
-                k_V = self.spline_k_V
-            elif self.method == 'linterp':
-                k_D = 1
-                k_V = 1
-            if self.sort_knots:
-                prior = prior * gptools.UniformJointPrior(
-                    [(self.roa_grid_DV.min(), self.roa_grid_DV.max())] * (self.num_eig_D - k_D + self.num_eig_V - k_V)
-                )
-            else:
-                prior = prior * (
-                    gptools.SortedUniformJointPrior(
-                        self.num_eig_D - k_D,
-                        self.roa_grid_DV.min(),
-                        self.roa_grid_DV.max()
-                    ) *
-                    gptools.SortedUniformJointPrior(
-                        self.num_eig_V - k_V,
-                        self.roa_grid_DV.min(),
-                        self.roa_grid_DV.max()
-                    )
-                )
-        
-        # TODO: This is hard-coded for just XTOMO 1 and 3! It should be
-        # generalized!
-        if self.use_scaling:
-            prior = prior * gptools.GammaJointPriorAlt(
-                [1.0] * (
-                    1 + self.signals[1].y.shape[1] +
-                    len(
-                        [k for k in (1, 3)]
-                    )
-                ),
-                [0.1] * (
-                    1 + self.signals[1].y.shape[1] +
-                    len(
-                        [k for k in (1, 3)]
-                    )
+            prior = prior * (
+                gptools.SortedUniformJointPrior(
+                    nkD,
+                    self.roa_grid_DV.min(),
+                    self.roa_grid_DV.max()
+                ) *
+                gptools.SortedUniformJointPrior(
+                    nkV,
+                    self.roa_grid_DV.min(),
+                    self.roa_grid_DV.max()
                 )
             )
+        # Scaling:
+        prior = prior * gptools.GammaJointPriorAlt([1.0,] * nS, [0.1,] * nS)
         
-        prior = prior * self.source_prior
+        # Shifts:
+        prior = prior * gptools.NormalJointPrior([0.0,] * nDiag, [2e-3,] * nDiag)
+        
+        # ne, Te:
+        prior = prior * gptools.NormalJointPrior(
+            [0.0,] * (self.num_eig_ne + self.num_eig_Te),
+            [1.0,] * (self.num_eig_ne + self.num_eig_Te)
+        )
         
         return prior
     
     def DV2cs_den(
             self,
-            params,
+            params=None,
             explicit_D=None,
             explicit_D_grid=None,
             explicit_V=None,
@@ -1327,18 +1561,17 @@ class Run(object):
         
         Parameters
         ----------
-        params : array of float
+        params : array of float, optional
             The parameters to use when evaluating the model. The order is:
+            
             * eig_D: The eigenvalues to use when evaluating the D profile.
             * eig_V: The eigenvalues to use when evaluating the V profile.
-            * param_D: The hyperparameters to use for the D profile.
-            * param_mu_D: The hyperparameters to use for the mean function of
-              the D profile.
-            * param_V: The hyperparameters to use for the V profile.
             * knots_D: The knots of the D profile.
             * knots_V: The knots of the V profile.
             * scaling: The scaling factors for each diagnostic.
             * param_source: The parameters to use for the model source function.
+            
+            If absent, :py:attr:`self.params` is used.
         explicit_D : array of float, optional
             Explicit values of D to use. Overrides the profile which would have
             been obtained from the parameters in `params` (but the scalings/etc.
@@ -1369,11 +1602,20 @@ class Run(object):
         """
         global NUM_STRAHL_CALLS
         
-        eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.split_params(params)
+        if params is not None:
+            params = scipy.asarray(params, dtype=float)
+            if len(params) == self.num_params:
+                self.params = params
+            else:
+                self.free_params = params
+        else:
+            params = self.params
+        
+        eig_D, eig_V, knots_D, knots_V, param_scaling, param_source, eig_ne, eig_Te = self.split_params()
         
         if (explicit_D is None) or (explicit_V is None):
             try:
-                D, V = self.eval_DV(params, plot=debug_plots)
+                D, V = self.eval_DV(plot=debug_plots)
             except ValueError:
                 print("Failure evaluating profiles!")
                 print(params)
@@ -1402,11 +1644,27 @@ class Run(object):
             return scipy.nan
         
         # Evaluate ne, Te:
-        ne = self.run_data.ne_res['mean_val']
-        Te = self.run_data.Te_res['mean_val']
+        ne_in = self.run_data.ne_p.gp.draw_sample(
+            self.run_data.ne_X,
+            rand_vars=scipy.atleast_2d(eig_ne).T,
+            method='eig',
+            num_eig=self.num_eig_ne,
+            mean=self.run_data.ne_res['mean_val'],
+            cov=self.run_data.ne_res['cov']
+        )[:, 0]
+        
+        Te_in = self.run_data.Te_p.gp.draw_sample(
+            self.run_data.Te_X,
+            rand_vars=scipy.atleast_2d(eig_Te).T,
+            method='eig',
+            num_eig=self.num_eig_Te,
+            mean=self.run_data.Te_res['mean_val'],
+            cov=self.run_data.Te_res['cov']
+        )[:, 0]
+        
         # HACK to get rid of negative values in ne, Te:
-        ne[ne < 0.0] = 0.0
-        Te[Te < 0.0] = 0.0
+        ne_in[ne_in < 0.0] = 0.0
+        Te_in[Te_in < 0.0] = 0.0
         
         # Now write the param and pp files, if required:
         if not no_write:
@@ -1418,8 +1676,8 @@ class Run(object):
             self.write_control(time_2_override=time_2_override)
             self.write_pp(
                 scipy.sqrt(self.psinorm_grid),
-                ne,
-                Te,
+                ne_in,
+                Te_in,
                 self.time_2 if steady_ar is None else time_2_override
             )
             self.write_param(
@@ -1473,6 +1731,30 @@ class Run(object):
         Te = scipy.asarray(f.variables['electron_temperature'][:], dtype=float)
         
         if debug_plots:
+            # Plot the ne, Te profiles:
+            f = plt.figure()
+            a_ne = f.add_subplot(2, 1, 1)
+            gptools.univariate_envelope_plot(
+                self.run_data.ne_X,
+                self.run_data.ne_res['mean_val'],
+                self.run_data.ne_res['std_val'],
+                ax=a_ne
+            )
+            a_ne.plot(self.run_data.ne_X, ne_in)
+            a_ne.set_xlabel("$r/a$")
+            a_ne.set_ylabel(r'$n_{\mathrm{e}}$')
+            
+            a_Te = f.add_subplot(2, 1, 2, sharex=a_ne)
+            gptools.univariate_envelope_plot(
+                self.run_data.Te_X,
+                self.run_data.Te_res['mean_val'],
+                self.run_data.Te_res['std_val'],
+                ax=a_Te
+            )
+            a_Te.plot(self.run_data.Te_X, Te_in)
+            a_Te.set_xlabel('$r/a$')
+            a_Te.set_ylabel(r"$T_{\mathrm{e}}$")
+            
             # Plot the charge state densities:
             slider_plot(
                 sqrtpsinorm,
@@ -1515,13 +1797,11 @@ class Run(object):
         
         return cs_den, sqrtpsinorm, time, ne, Te
     
-    def cs_den2dlines(self, params, cs_den, sqrtpsinorm, time, ne, Te, steady_ar=None, debug_plots=False):
+    def cs_den2dlines(self, cs_den, sqrtpsinorm, time, ne, Te, steady_ar=None, debug_plots=False):
         """Predicts the local emissivities that would arise from the given charge state densities.
         
         Parameters
         ----------
-        params : array of float
-            The parameters to use.
         cs_den : array of float, (`n_time`, `n_cs`, `n_space`)
             The charge state densities as computed by STRAHL.
         sqrtpsinorm : array of float, (`n_space`,)
@@ -1538,8 +1818,6 @@ class Run(object):
             If True, plots of the various steps will be generated. Default is
             False (do not produce plots).
         """
-        eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.split_params(params)
-        
         atomdat = self.atomdat if steady_ar is None else self.Ar_atomdat
         # Put the SXR signal as the final entry in dlines.
         n_lines = len(atomdat[0]) + 1 if steady_ar is None else 1
@@ -1619,14 +1897,7 @@ class Run(object):
         
         return dlines
     
-    def dlines2sig(
-            self,
-            params,
-            dlines,
-            time,
-            steady_ar=None,
-            debug_plots=False,
-        ):
+    def dlines2sig(self, dlines, time, params=None, steady_ar=None, debug_plots=False):
         """Computes the diagnostic signals corresponding to the given local emissivities.
         
         Takes each signal in :py:attr:`self.signals`, applies the weights (if
@@ -1638,19 +1909,26 @@ class Run(object):
         
         Parameters
         ----------
-        params : array of float
-            The parameters to use.
         dlines : array of float, (`n_time`, `n_lines`, `n_space`)
             The spatial profiles of local emissivities.
         time : array of float, (`n_time`,)
             The time grid which `dlines` is given on.
+        params : array of float
+            The parameters to use. If absent, :py:attr:`self.params` is used.
         steady_ar : float, optional
             If None, compute for calcium. If a float, compute for argon.
         debug_plots : bool, optional
             If True, plots of the various steps will be generated. Default is
             False (do not produce plots).
         """
-        eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.split_params(params)
+        if params is not None:
+            params = scipy.asarray(params, dtype=float)
+            if len(params) == self.num_params:
+                self.params = params
+            else:
+                self.free_params = params
+        
+        eig_D, eig_V, knots_D, knots_V, param_scaling, param_source, eig_ne, eig_Te = self.split_params()
         
         time = time - self.time_1
         # Apply the diagnostic time shifts:
@@ -1683,8 +1961,7 @@ class Run(object):
                     if self.normalize:
                         out_arr[:, mask] = out_arr[:, mask] / out_arr[:, mask].max()
                     # Scaling:
-                    if self.use_scaling:
-                        out_arr[:, mask] *= param_scaling[k]
+                    out_arr[:, mask] *= param_scaling[k]
                     k += 1
                 
                 sig.append(out_arr)
@@ -1717,13 +1994,11 @@ class Run(object):
         
         return sig
     
-    def sig2diffs(self, params, sig, time, steady_ar=None):
+    def sig2diffs(self, sig, steady_ar=None):
         """Computes the individual diagnostic differences corresponding to the given signals.
         
         Parameters
         ----------
-        params : array of float
-            The parameters to use.
         sig : list of arrays of float
             The diagnostic signals. There should be one entry for each element
             of :py:attr:`self.signals`. Each entry should be an array
@@ -1733,13 +2008,6 @@ class Run(object):
         steady_ar : float, optional
             If None, compute for calcium. If a float, compute for argon.
         """
-        eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.split_params(params)
-        
-        time = time - self.time_1
-        time_s = time + param_source[0]
-        time_v = time + param_source[1]
-        time_xtomo = time + param_source[2]
-        
         # Convert to differences:
         # Weighting must be accomplished in diffs2ln_prob.
         if steady_ar is None:
@@ -1753,10 +2021,10 @@ class Run(object):
     
     def diffs2ln_prob(
             self,
-            params,
             sig_diff,
+            params=None,
             steady_ar=None,
-            d_weights=[1.0, 1.0, 1.0],
+            d_weights=None,
             sign=1.0
         ):
         r"""Computes the log-posterior corresponding to the given differences.
@@ -1786,12 +2054,12 @@ class Run(object):
         
         Parameters
         ----------
-        params : array of float
-            The parameters to use.
         sig_diff : list of arrays of float
             The diagnostic signal differences. There should be one entry for
             each element of :py:attr:`self.signals`. Each entry should
             be an array of float with shape (`n_time`, `n_chords`).
+        params : array of float
+            The parameters to use. If absent, :py:attr:`self.params` is used.
         steady_ar : float, optional
             If None, compute for calcium. If a float, compute for argon.
         d_weights : list of float, (`n_sig`,), or list of arrays of float
@@ -1805,6 +2073,16 @@ class Run(object):
             to use this function with a minimizer, for instance. Default is 1.0
             (return actual log-posterior).
         """
+        if params is not None:
+            params = scipy.asarray(params, dtype=float)
+            if len(params) == self.num_params:
+                self.params = params
+            else:
+                self.free_params = params
+        
+        if d_weights is None:
+            d_weights = [1.0,] * len(self.signals)
+        
         if steady_ar is None:
             chi2 = 0.0
             for w, s, ss in zip(d_weights, sig_diff, self.signals):
@@ -1818,7 +2096,7 @@ class Run(object):
         if chi2 == 0.0:
             return -sign * scipy.inf
         else:
-            lp = sign * (-0.5 * chi2 + self.get_prior()(params))
+            lp = sign * (-0.5 * chi2 + self.get_prior()(self.params))
             # print(lp)
             return lp
     
@@ -1829,7 +2107,7 @@ class Run(object):
     
     def DV2dlines(
             self,
-            params,
+            params=None,
             explicit_D=None,
             explicit_D_grid=None,
             explicit_V=None,
@@ -1853,7 +2131,7 @@ class Run(object):
             Default is False (just return dlines).
         """
         out = self.DV2cs_den(
-            params,
+            params=params,
             explicit_D=explicit_D,
             explicit_D_grid=explicit_D_grid,
             explicit_V=explicit_V,
@@ -1869,10 +2147,9 @@ class Run(object):
         except (TypeError, ValueError):
             raise RuntimeError(
                 "Something went wrong with STRAHL, return value of DV2cs_den is: '"
-                + str(out) + "', params are: " + str(params)
+                + str(out) + "', params are: " + str(self.params)
             )
         out = self.cs_den2dlines(
-            params,
             cs_den,
             sqrtpsinorm,
             time,
@@ -1888,12 +2165,12 @@ class Run(object):
     
     def cs_den2sig(
             self,
-            params,
             cs_den,
             sqrtpsinorm,
             time,
             ne,
             Te,
+            params=None,
             steady_ar=None,
             debug_plots=False,
         ):
@@ -1903,7 +2180,6 @@ class Run(object):
         :py:meth:`dlines2sig`. See those functions for argument descriptions.
         """
         dlines = self.cs_den2dlines(
-            params,
             cs_den,
             sqrtpsinorm,
             time,
@@ -1913,18 +2189,18 @@ class Run(object):
             debug_plots=debug_plots
         )
         return self.dlines2sig(
-            params,
             dlines,
             time,
+            params=params,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
         )
     
     def dlines2diffs(
             self,
-            params,
             dlines,
             time,
+            params=None,
             steady_ar=None,
             debug_plots=False,
         ):
@@ -1934,24 +2210,19 @@ class Run(object):
         :py:meth:`sig2diffs`. See those functions for argument descriptions.
         """
         sig = self.dlines2sig(
-            params,
             dlines,
             time,
+            params=params,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
         )
-        return self.sig2diffs(
-            params,
-            sig,
-            time,
-            steady_ar=steady_ar
-        )
+        return self.sig2diffs(sig, steady_ar=steady_ar)
     
     def sig2ln_prob(
             self,
-            params,
             sig,
             time,
+            params=None,
             steady_ar=None,
             d_weights=[1.0, 1.0, 1.0],
             sign=1.0
@@ -1961,15 +2232,10 @@ class Run(object):
         This is simply a wrapper around the chain of :py:meth:`sig2diffs` ->
         :py:meth:`diffs2ln_prob`. See those functions for argument descriptions.
         """
-        sig_diff = self.sig2diffs(
-            params,
-            sig,
-            time,
-            steady_ar=steady_ar
-        )
+        sig_diff = self.sig2diffs(sig, steady_ar=steady_ar)
         return self.diffs2ln_prob(
-            params,
             sig_diff,
+            params=params,
             steady_ar=steady_ar,
             d_weights=d_weights,
             sign=sign
@@ -1977,7 +2243,7 @@ class Run(object):
     
     def DV2sig(
             self,
-            params,
+            params=None,
             explicit_D=None,
             explicit_D_grid=None,
             explicit_V=None,
@@ -1995,7 +2261,7 @@ class Run(object):
         for argument descriptions.
         """
         out = self.DV2cs_den(
-            params,
+            params=params,
             explicit_D=explicit_D,
             explicit_D_grid=explicit_D_grid,
             explicit_V=explicit_V,
@@ -2014,7 +2280,6 @@ class Run(object):
                 + str(out) + "', params are: " + str(params)
             )
         dlines = self.cs_den2dlines(
-            params,
             cs_den,
             sqrtpsinorm,
             time,
@@ -2024,21 +2289,21 @@ class Run(object):
             debug_plots=debug_plots
         )
         return self.dlines2sig(
-            params,
             dlines,
             time,
+            params=params,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
         )
     
     def cs_den2diffs(
             self,
-            params,
             cs_den,
             sqrtpsinorm,
             time,
             ne,
             Te,
+            params=None,
             steady_ar=None,
             debug_plots=False,
         ):
@@ -2049,7 +2314,6 @@ class Run(object):
         argument descriptions.
         """
         dlines = self.cs_den2dlines(
-            params,
             cs_den,
             sqrtpsinorm,
             time,
@@ -2059,24 +2323,19 @@ class Run(object):
             debug_plots=debug_plots
         )
         sig = self.dlines2sig(
-            params,
             dlines,
             time,
+            params=params,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
         )
-        return self.sig2diffs(
-            params,
-            sig,
-            time,
-            steady_ar=steady_ar
-        )
+        return self.sig2diffs(sig, steady_ar=steady_ar)
     
     def dlines2ln_prob(
             self,
-            params,
             dlines,
             time,
+            params=None,
             steady_ar=None,
             debug_plots=False,
             d_weights=[1.0, 1.0, 1.0],
@@ -2089,21 +2348,16 @@ class Run(object):
         for argument descriptions.
         """
         sig = self.dlines2sig(
-            params,
             dlines,
             time,
+            params=params,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
         )
-        sig_diff = self.sig2diffs(
-            params,
-            sig,
-            time,
-            steady_ar=steady_ar
-        )
+        sig_diff = self.sig2diffs(sig, steady_ar=steady_ar)
         return self.diffs2ln_prob(
-            params,
             sig_diff,
+            params=params,
             steady_ar=steady_ar,
             d_weights=d_weights,
             sign=sign
@@ -2111,7 +2365,7 @@ class Run(object):
     
     def DV2diffs(
             self,
-            params,
+            params=None,
             explicit_D=None,
             explicit_D_grid=None,
             explicit_V=None,
@@ -2129,7 +2383,7 @@ class Run(object):
         See those functions for argument descriptions.
         """
         out = self.DV2cs_den(
-            params,
+            params=params,
             explicit_D=explicit_D,
             explicit_D_grid=explicit_D_grid,
             explicit_V=explicit_V,
@@ -2148,7 +2402,6 @@ class Run(object):
                 + str(out) + "', params are: " + str(params)
             )
         dlines = self.cs_den2dlines(
-            params,
             cs_den,
             sqrtpsinorm,
             time,
@@ -2158,27 +2411,22 @@ class Run(object):
             debug_plots=debug_plots
         )
         sig = self.dlines2sig(
-            params,
             dlines,
             time,
+            params=params,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
         )
-        return self.sig2diffs(
-            params,
-            sig,
-            time,
-            steady_ar=steady_ar
-        )
+        return self.sig2diffs(sig, steady_ar=steady_ar)
     
     def cs_den2ln_prob(
             self,
-            params,
             cs_den,
             sqrtpsinorm,
             time,
             ne,
             Te,
+            params=None,
             steady_ar=None,
             debug_plots=False,
             d_weights=[1.0, 1.0, 1.0],
@@ -2191,7 +2439,6 @@ class Run(object):
         See those functions for argument descriptions.
         """
         dlines = self.cs_den2dlines(
-            params,
             cs_den,
             sqrtpsinorm,
             time,
@@ -2201,75 +2448,87 @@ class Run(object):
             debug_plots=debug_plots
         )
         sig = self.dlines2sig(
-            params,
             dlines,
             time,
+            params=params,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
         )
-        sig_diff = self.sig2diffs(
-            params,
-            sig,
-            time,
-            steady_ar=steady_ar
-        )
+        sig_diff = self.sig2diffs(sig, steady_ar=steady_ar)
         return self.diffs2ln_prob(
-            params,
             sig_diff,
+            params=params,
             steady_ar=steady_ar,
             d_weights=d_weights,
             sign=sign
         )
     
     # Special handling for local measurements:
-    def cs_den2local_diffs(self, params, cs_den, sqrtpsinorm, time, cs_mask=None):
-        """Computes the differences in local charge state densities corresponding to the given local charge state densities.
+    def cs_den2local_sigs(self, cs_den, sqrtpsinorm, time, debug_plots=False):
+        """Computes the local charge state densities.
         
         Interpolates the local charge state densities from STRAHL onto the same
-        grid as :py:attr:`self.run_data.cs_den` and finds the difference. This
-        is only done for the charge states specified in `cs_mask` to save time.
+        grid as :py:attr:`self.local_signals`.
         
         Parameters
         ----------
-        params : array of float
-            The parameters to use.
         cs_den : array of float, (`n_time`, `n_cs`, `n_space`)
             The charge state densities as computed by STRAHL.
         sqrtpsinorm : array of float, (`n_space`,)
             The square root of psinorm grid which `cs_den` is given on.
         time : array of float, (`n_time`,)
             The time grid which `cs_den` is given on.
-        cs_mask : array of bool, (`n_cs`,), optional
-            The charge states to use in the inference. These are given in
-            ascending order, such that the (zero-based) index is the charge of
-            the ion. The default is to use all charge states (including the
-            neutrals).
         
         Returns
         -------
-        local_diffs : array of float, (`n_time`, `n_cs_masked`, `n_space`)
-            The difference between the predicted and observed local charge state
-            densities, as a function of time and space.
+        local_sig : list of arrays of float, (`n_time`, `n_space`)
+            The predicted local charge state densities, as a function of time
+            and space. There is one entry for each item in
+            :py:attr:`self.local_signals`.
         """
-        # TODO: Needs a flag to turn normalization on/off!
-        if cs_mask is None:
-            cs_mask = scipy.ones(cs_den.shape[1], dtype=bool)
+        local_sig = []
+        for sls in self.local_signals:
+            if sls.cs_den_idx is None:
+                spl = scipy.interpolate.RectBivariateSpline(time - self.time_1, sqrtpsinorm, cs_den.sum(axis=1))
+            else:
+                spl = scipy.interpolate.RectBivariateSpline(time - self.time_1, sqrtpsinorm, cs_den[:, sls.cs_den_idx, :])
+            local_sig.append(spl(sls.t, sls.sqrtpsinorm))
+            if self.normalize:
+                local_sig[-1] /= local_sig[-1].max()
         
-        # Throw out the charge states which are not to be included in the inference:
-        cs_den = cs_den[:, cs_mask, :]
-        local_diffs = scipy.zeros_like(self.run_data.cs_den[:, cs_mask, :])
+        if debug_plots:
+            for s, sls in zip(local_sig, self.local_signals):
+                f, a = sls.plot_data(norm=self.normalize)
+                for i, ax in enumerate(a):
+                    ax.plot(sls.t, s[:, i])
         
-        # Loop over the charge states which are to be included in the inference and
-        # interpolate them onto the time and space grid used in run_data:
-        for i in range(0, cs_den.shape[1]):
-            local_diffs[:, i, :] = scipy.interpolate.RectBivariateSpline(
-                time, sqrtpsinorm, cs_den[:, i, :], s=0
-            )(run_data.cs_time, run_data.cs_sqrtpsinorm) - run_data.cs_den[:, cs_mask, :]
+        return local_sig
         
+    def local_sig2local_diffs(self, local_sig):
+        """Computes the differences in local charge state densities.
+        
+        Interpolates the local charge state densities from STRAHL onto the same
+        grid as :py:attr:`self.local_signals` and finds the difference.
+        
+        Parameters
+        ----------
+        local_sig : list of array of float
+            The local signals predicted by STRAHL, interpolated to the correct
+            space/time grid.
+        
+        Returns
+        -------
+        local_diffs : list of arrays of float, (`n_time`, `n_space`)
+            The differences between the predicted and observed local signals, as
+            a function of time and space.
+        """
+        local_diffs = []
+        for s, ss in zip(local_sig, self.local_signals):
+            local_diffs.append(s - (ss.y_norm if self.normalize else ss.y))
         return local_diffs
     
-    def local_diffs2ln_prob(self, params, local_diffs, cs_mask=None, sign=1.0):
-        r"""Computes the log-posterior corresponding to the given local charge state density differences.
+    def local_diffs2ln_prob(self, local_diffs, sign=1.0):
+        r"""Computes the log-posterior corresponding to the given local signal differences.
         
         Here, the weighted differences :math:`\chi^2` are given as
         
@@ -2287,17 +2546,9 @@ class Run(object):
         
         Parameters
         ----------
-        params : array of float
-            The parameters to use.
-        local_diffs : array of float, (`n_time`, `n_cs_masked`, `n_space`)
-            The difference between the predicted and observed local charge state
-            densities, as a function of time and space.
-        cs_mask : array of bool, (`n_cs`,), optional
-            The charge states to use in the inference. These are given in
-            ascending order, such that the (zero-based) index is the charge of
-            the ion. The default is to use all charge states (including the
-            neutrals). THIS MUST BE THE SAME AS WAS USED WHEN CALLING
-            :py:meth:`cs_den2local_diffs` OR IT WILL NOT WORK RIGHT!
+        local_diffs : list of arrays of float, (`n_time`, `n_space`)
+            The difference between the predicted and observed local signals, as
+            a function of time and space.
         sign : float, optional
             Sign (or other factor) applied to the final result. Set this to -1.0
             to use this function with a minimizer, for instance. Default is 1.0
@@ -2308,18 +2559,20 @@ class Run(object):
         lp : float
             The log-posterior.
         """
-        if cs_mask is None:
-            cs_mask = scipy.ones(local_diffs.shape[1])
-        
-        # TODO: Put flags to turn noise/normalization on/off!
-        chi2 = ((local_diffs / self.run_data.cs_den_uncertainty[:, cs_mask, :])**2.0).sum()
-        lp = sign * (-0.5 * chi2 + self.get_prior()(params))
-        return lp
+        chi2 = 0.0
+        for s, ss in zip(local_diffs, self.local_signals):
+            dnorm2 = (s / (ss.std_y_norm if self.normalize else ss.std_y))**2.0
+            chi2 += dnorm2[~scipy.isnan(dnorm2)].sum()
+        if chi2 == 0.0:
+            return -sign * scipy.inf
+        else:
+            lp = sign * (-0.5 * chi2 + self.get_prior()(self.params))
+            return lp
     
     # End-to-end routines:
     def DV2ln_prob(
             self,
-            params,
+            params=None,
             sign=1.0,
             explicit_D=None,
             explicit_D_grid=None,
@@ -2349,7 +2602,7 @@ class Run(object):
             measurements. Default is False (use line-integrated measurements).
         """
         out = self.DV2cs_den(
-            params,
+            params=params,
             explicit_D=explicit_D,
             explicit_D_grid=explicit_D_grid,
             explicit_V=explicit_V,
@@ -2368,11 +2621,10 @@ class Run(object):
                 + str(out) + "', params are: " + str(params)
             )
         if use_local:
-            local_diffs = self.cs_den2local_diffs(params, cs_den, sqrtpsinorm, time, cs_mask=cs_mask)
-            return self.local_diffs2ln_prob(params, local_diffs, cs_mask=cs_mask, sign=sign)
+            local_diffs = self.cs_den2local_diffs(cs_den, sqrtpsinorm, time, cs_mask=cs_mask)
+            return self.local_diffs2ln_prob(local_diffs, cs_mask=cs_mask, sign=sign)
         else:
             dlines = self.cs_den2dlines(
-                params,
                 cs_den,
                 sqrtpsinorm,
                 time,
@@ -2382,21 +2634,16 @@ class Run(object):
                 debug_plots=debug_plots
             )
             sig = self.dlines2sig(
-                params,
                 dlines,
                 time,
+                params=params,
                 steady_ar=steady_ar,
                 debug_plots=debug_plots,
             )
-            sig_diff = self.sig2diffs(
-                params,
-                sig,
-                time,
-                steady_ar=steady_ar
-            )
+            sig_diff = self.sig2diffs(sig, steady_ar=steady_ar)
             return self.diffs2ln_prob(
-                params,
                 sig_diff,
+                params=params,
                 steady_ar=steady_ar,
                 d_weights=d_weights,
                 sign=sign
@@ -2870,7 +3117,6 @@ class Run(object):
             He_like_core_peak, D_grid, V_grid, title=r"Peak core He-like impurity density",
             callback=on_click, logscale=True
         )
-        
     
     def find_MAP_estimate(self, random_starts=None, num_proc=None, pool=None, theta0=None, thresh=None):
         """Find the most likely parameters given the data.
@@ -3004,6 +3250,7 @@ class Run(object):
             res, = self.find_MAP_estimate(random_starts=0, num_proc=1, theta0=params)
             new_params = self.get_prior().sample_u(res[0])
             lp = res[1]
+            # TODO: This needs to be updated!
             ll = res[1] - self.get_prior()(new_params)
             new_status = res[2]
             
@@ -3129,7 +3376,7 @@ class Run(object):
         if filter_bad:
             is_bad = scipy.zeros_like(lp, dtype=bool)
             for i, p in enumerate(params):
-                eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.split_params(p)
+                eig_D, eig_V, knots_D, knots_V, param_scaling, param_source, eig_ne, eig_Te = self.split_params(p)
                 is_bad[i] = (
                     knots_D.min() <= self.roa_grid_DV[3] or
                     knots_D.max() >= self.roa_grid_DV[-4] or
@@ -3773,33 +4020,7 @@ class Run(object):
             temperature ladder to slow down on) and `adaptation_time` (the
             timescale of the temperature adaptation dynamics themselves).
         """
-        if self.method == 'GP':
-            ndim = (
-                self.num_eig_D +
-                self.num_eig_V +
-                self.k_D.num_free_params +
-                self.mu_D.num_free_params +
-                self.k_V.num_free_params +
-                ((7 if self.clusters else 5) if self.source_file is None else 3)
-            )
-        elif self.method == 'spline':
-            ndim = (
-                self.num_eig_D +
-                self.num_eig_V +
-                (self.num_eig_D - self.spline_k_D if self.free_knots else 0) +
-                (self.num_eig_V - self.spline_k_V if self.free_knots else 0) +
-                ((7 if self.clusters else 5) if self.source_file is None else 3)
-            )
-        elif self.method == 'linterp':
-            ndim = (
-                self.num_eig_D +
-                self.num_eig_V +
-                (self.num_eig_D - 1 if self.free_knots else 0) +
-                (self.num_eig_V - 1 if self.free_knots else 0) +
-                ((7 if self.clusters else 5) if self.source_file is None else 3)
-            )
-        if self.use_scaling:
-            ndim += 1 + self.signals[1].y.shape[1]
+        ndim = (~self.fixed_params).sum()
         if burn is None:
             burn = nsamp // 2
         if num_proc is None:
@@ -4159,34 +4380,33 @@ class Run(object):
     def get_labels(self):
         """Get the labels for each of the variables included in the sampler.
         """
+        # Make typing array lengths more compact:
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            nS += len(scipy.unique(s.blocks))
+        
+        # Number of diagnostics (determines number of time shifts):
+        nDiag = len(self.signals)
+        
         labels = (
-            ['$u_{D,%d}$' % (n,) for n in xrange(0, self.num_eig_D)] +
-            ['$u_{V,%d}$' % (n,) for n in xrange(0, self.num_eig_V)]
+            ['$C_{D,%d}$' % (n + 1,) for n in xrange(0, nD)] +
+            ['$C_{V,%d}$' % (n + 1,) for n in xrange(0, nV)]
         )
-        if self.method == 'GP':
-            labels += (
-                ['$' + n + ', D$' for n in self.k_D.param_names] +
-                ['$' + n + ', D$' for n in self.mu_D.param_names] +
-                ['$' + n + ', V$' for n in self.k_V.param_names]
-            )
-        elif self.free_knots:
-            if self.method == 'spline':
-                labels += ['$x_{D,%d}$' % (n + 1,) for n in xrange(0, self.num_eig_D - self.spline_k_D)]
-                labels += ['$x_{V,%d}$' % (n + 1,) for n in xrange(0, self.num_eig_V - self.spline_k_V)]
-            elif self.method == 'linterp':
-                labels += ['$x_{V,%d}$' % (n + 1,) for n in xrange(0, self.num_eig_D - 1)]
-                labels += ['$x_{D,%d}$' % (n + 1,) for n in xrange(0, self.num_eig_V - 1)]
-        if self.use_scaling:
-            labels += [r'$s$ H']
-            for k in xrange(0, self.signals[1].y.shape[1]):
-                labels += [r'$s$ V%d' % (k + 1,)]
-            for k in (1, 3):
-                labels += [r'$s$ XTOMO %d' % (k,)]
-        labels += [r'$\Delta t$ H', r'$\Delta t$ V', r'$\Delta t$ XTOMO']
-        if self.source_file is None:
-            labels += ['$t_{rise}$', '$n_{rise}$', '$t_{fall}$', '$n_{fall}']
-            if self.clusters:
-                labels += ['$t_{cluster}$', '$h_{cluster}$']
+        labels += ['$t_{D,%d}$' % (n + 1,) for n in xrange(0, nkD)]
+        labels += ['$t_{V,%d}$' % (n + 1,) for n in xrange(0, nkV)]
+        labels += [r'$s$ %d' % (n,) for n in xrange(0, nS)]
+        labels += [r'$\Delta t$ %d' % (n,) for  n in xrange(0, nDiag)]
+        labels += [r'$u_{n_{\mathrm{e}},%d}$' % (n + 1,) for n in xrange(0, self.num_eig_ne)]
+        labels += [r'$u_{T_{\mathrm{e}},%d}$' % (n + 1,) for n in xrange(0, self.num_eig_Te)]
+        
         return labels
     
     def process_sampler(self, sampler, burn=0, thin=1):
@@ -5155,8 +5375,6 @@ class Run(object):
                 elsym=element,
                 mass=periodictable.__dict__[element].mass,
                 shot=self.shot,
-                time_1=self.time_1,
-                time_2=(self.time_2 if time_2_override is None else time_2_override),
                 NC=-1 * int(compute_NC),
                 num_rho_D=len(D_grid),
                 num_rho_V=len(V_grid),
@@ -5166,8 +5384,8 @@ class Run(object):
                 V_points=V_str,
                 source=1e17 if const_source is None else const_source,
                 from_file=const_source is None,
-                time_spec=self.time_spec,
-                n_time_spec=len(self.time_spec.splitlines())
+                time_spec=self.time_spec if time_2_override is None else DEFAULT_TIME_SPEC.format(time_1=self.time_1, time_2=time_2_override),
+                n_time_spec=len(self.time_spec.splitlines()) if time_2_override is None else 2
             )
         )
         
@@ -5177,9 +5395,9 @@ class Run(object):
         return contents
     
     def write_source(self, t, s):
-        """Write a STRAHL source file.
+        r"""Write a STRAHL source file.
         
-        Will overwrite whatever :py:attr:`self.source_file` is.
+        Will overwrite nete/Caflx{SHOT}.dat.
         
         Parameters
         ----------
@@ -5192,7 +5410,7 @@ class Run(object):
         for tv, sv in zip(t, s):
             contents += '    %5.5f    %5.5e\n' % (tv, sv)
         
-        with open(self.source_file, 'w') as f:
+        with open('neta/Caflx%d.dat' % (self.shot,), 'w') as f:
             f.write(contents)
     
     def compute_view_data(self, debug_plots=False, contour_axis=None, **kwargs):
@@ -5835,6 +6053,34 @@ class RunData(object):
         argv += [str(x) for x in self.roa_grid]
         argv += flags
         return profiletools.gui.run_gui(argv=argv)
+    
+    def plot_eigenvalue_spectrum(self, thresh=0.1):
+        """Plot the eigenvalue spectra of the ne, Te fits.
+        
+        This is used to select a cutoff eigenvalue.
+        """
+        eig_ne, Q_ne = scipy.linalg.eigh(self.ne_res['cov'])
+        eig_Te, Q_Te = scipy.linalg.eigh(self.Te_res['cov'])
+        
+        num_eig_ne = (scipy.sqrt(eig_ne[::-1] / eig_ne.max()) >= thresh).sum()
+        num_eig_Te = (scipy.sqrt(eig_Te[::-1] / eig_Te.max()) >= thresh).sum()
+        
+        f = plt.figure()
+        a_ne = f.add_subplot(2, 1, 1)
+        a_ne.plot(scipy.sqrt(eig_ne[::-1] / eig_ne.max()), 'o-')
+        a_ne.axhline(thresh)
+        a_ne.set_xlabel('number')
+        a_ne.set_ylabel(r'$\sqrt{\lambda / \lambda_0}$')
+        a_ne.set_title(r"$n_{\mathrm{e}}$")
+        
+        a_Te = f.add_subplot(2, 1, 2)
+        a_Te.plot(scipy.sqrt(eig_Te[::-1] / eig_Te.max()), 'o-')
+        a_Te.axhline(thresh)
+        a_Te.set_xlabel('number')
+        a_Te.set_ylabel(r'$\sqrt{\lambda / \lambda_0}$')
+        a_Te.set_title(r"$T_{\mathrm{e}}$")
+        
+        return num_eig_ne, num_eig_Te
 
 class TruthData(object):
     """Class to hold the truth values for synthetic data.
@@ -6075,6 +6321,46 @@ class Signal(object):
         f.canvas.draw()
         
         return (f, a)
+
+class LocalSignal(Signal):
+    """Class to store local charge state density measurements.
+    
+    Parameters
+    ----------
+    y : array of float, (`n_time`, `n_space`)
+        
+    """
+    def __init__(self, y, std_y, y_norm, std_y_norm, t, sqrtpsinorm, cs_den_idx):
+        self.y = scipy.asarray(y, dtype=float)
+        if y.ndim != 2:
+            raise ValueError("y must have exactly 2 dimensions!")
+        self.std_y = scipy.asarray(std_y, dtype=float)
+        if self.std_y.shape != self.y.shape:
+            raise ValueError("std_y must have the same shape as y!")
+        self.y_norm = scipy.asarray(y_norm, dtype=float)
+        if self.y_norm.shape != self.y.shape:
+            raise ValueError("y_norm must have the same shape as y!")
+        self.std_y_norm = scipy.asarray(std_y_norm, dtype=float)
+        if self.std_y_norm.shape != self.y.shape:
+            raise ValueError("std_y_norm must have the same shape as y!")
+        self.sqrtpsinorm = scipy.asarray(sqrtpsinorm, dtype=float)
+        if self.sqrtpsinorm.ndim != 1:
+            raise ValueError("sqrtpsinorm must have exactly 1 dimension!")
+        if self.y.shape[1] != len(self.sqrtpsinorm):
+            raise ValueError("Length of sqrtpsinorm must equal self.y.shape[1]!")
+        self.t = scipy.asarray(t, dtype=float)
+        if self.t.ndim != 1:
+            raise ValueError("t must have exactly 1 dimension!")
+        if self.y.shape[0] != len(self.t):
+            raise ValueError("Length of t must equal self.y.shape[0]!")
+        self.cs_den_idx = cs_den_idx
+    
+    @property
+    def name(self):
+        if self.cs_den_idx is None:
+            return [r'local $n_Z$, $\sqrt{\psi_{\mathrm{n}}}=%.1f$' % (rho,) for rho in self.sqrtpsinorm]
+        else:
+            return [r'local $n_{Z,%d}$, $\sqrt{\psi_{\mathrm{n}}}=%.1f$' % (self.cs_den_idx, rho) for rho in self.sqrtpsinorm]
 
 class HirexData(object):
     """Helper object to load and process the HiReX-SR data.
@@ -6626,95 +6912,6 @@ def slider_plot(x, y, z, xlabel='', ylabel='', zlabel='', labels=None, plot_sum=
         'key_press_event',
         lambda evt: arrow_respond(slider, evt)
     )
-
-# if _have_PyGMO:
-#     class MAPProblem(PyGMO.problem.base):
-#         """Problem to be used with PyGMO for global optimization.
-#         """
-#         def __init__(self, run=None):
-#             # This goofy argument nonsense is to deal with how copy.deepcopy works.
-#             if run is None:
-#                 super(MAPProblem, self).__init__(1)
-#             else:
-#                 self.run = run
-#                 if run.method == 'GP':
-#                     ndim = (
-#                         run.num_eig_D +
-#                         run.num_eig_V +
-#                         run.k_D.num_free_params +
-#                         run.mu_D.num_free_params +
-#                         run.k_V.num_free_params +
-#                         ((7 if run.clusters else 5) if run.source_file is None else 2)
-#                     )
-#                 elif run.method == 'spline':
-#                     ndim = (
-#                         run.num_eig_D +
-#                         run.num_eig_V +
-#                         (run.num_eig_D - run.spline_k_D if run.free_knots else 0) +
-#                         (run.num_eig_V - run.spline_k_V if run.free_knots else 0) +
-#                         ((7 if run.clusters else 5) if run.source_file is None else 2)
-#                     )
-#                 elif run.method == 'linterp':
-#                     ndim = (
-#                         run.num_eig_D +
-#                         run.num_eig_V +
-#                         (run.num_eig_D - 1 if run.free_knots else 0) +
-#                         (run.num_eig_V - 1 if run.free_knots else 0) +
-#                         ((7 if run.clusters else 5) if run.source_file is None else 2)
-#                     )
-#                 if run.use_scaling:
-#                     ndim += 1 + run.run_data.vuv_signals_norm_combined.shape[0]
-#
-#                 if run.method in ('spline', 'linterp') and run.free_knots:
-#                     if run.method == 'spline':
-#                         cdim = (run.num_eig_D - run.spline_k_D - 1) + (run.num_eig_V - run.spline_k_V - 1)
-#                     else:
-#                         cdim = (run.num_eig_D - 1 - 1) + (run.num_eig_V - 1 - 1)
-#                 else:
-#                     cdim = 0
-#
-#                 super(MAPProblem, self).__init__(ndim)#, 0, 1, cdim, cdim, 0)
-#
-#                 bounds = scipy.asarray(self.run.get_prior().bounds[:])
-#
-#                 self.set_bounds(bounds[:, 0], bounds[:, 1])
-#
-#         def _objfun_impl(self, x):
-#             acquire_working_dir()
-#             try:
-#                 out = self.run.compute_ln_prob(
-#                     x,
-#                     sign=-1
-#                 )
-#             except:
-#                 warnings.warn(
-#                     "Unhandled exception. Error is: %s: %s. "
-#                     "Params are: %s" % (
-#                         sys.exc_info()[0],
-#                         sys.exc_info()[1],
-#                         x
-#                     )
-#                 )
-#                 out = scipy.inf
-#             finally:
-#                 release_working_dir()
-#             # Some optimizers don't like infinite values, apparently:
-#             if scipy.isinf(out):
-#                 out = sys.float_info.max
-#             else:
-#                 out = float(out)
-#             return (out,)
-#
-#         # def _compute_constraints_impl(self, x):
-#         #     """Compute the constraints on the knots.
-#         #
-#         #     I assume PyGMO will respect the bounds in any case.
-#         #
-#         #     I also assume PyGMO will treat a constraint as satisfied if it is >= 0.
-#         #     """
-#         #     eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.run.split_params(x)
-#         #
-#         #     return scipy.concatenate((scipy.diff(knots_D), scipy.diff(knots_V)))
 
 class _ComputeLnProbWrapper(object):
     """Wrapper to support parallel execution of STRAHL runs.
@@ -8957,7 +9154,7 @@ class ParameterExplorer(tk.Tk):
         self.hirex_vuv_frame.suptitle_h.set_text("%.3e" % (lp,))
         self.hirex_vuv_frame.suptitle_v.set_text("%.3e" % (lp,))
         
-        eig_D, eig_V, knots_D, knots_V, hp_D, hp_mu_D, hp_V, param_scaling, param_source = self.r.split_params(params)
+        eig_D, eig_V, knots_D, knots_V, param_scaling, param_source = self.r.split_params(params)
         
         time = time - self.r.time_1
         time_s = scipy.sort(self.r.signals[0].t + param_source[0])
