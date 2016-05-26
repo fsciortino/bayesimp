@@ -51,12 +51,13 @@ import TRIPPy
 import TRIPPy.XTOMO
 from gptools.splines import spev
 import itertools
-try:
-    import PyGMO
-    _have_PyGMO = True
-except ImportError:
-    warnings.warn("Could not import PyGMO!", RuntimeWarning)
-    _have_PyGMO = False
+# try:
+#     import PyGMO
+#     _have_PyGMO = True
+# except ImportError:
+#     warnings.warn("Could not import PyGMO!", RuntimeWarning)
+#     _have_PyGMO = False
+import pymultinest
 import periodictable
 import lines
 import nlopt
@@ -552,6 +553,7 @@ class Run(object):
         
         global MASTER_DIR
         
+        self._ll_normalization_local = None
         self._ll_normalization = None
         self._ar_ll_normalization = None
         
@@ -1238,7 +1240,8 @@ class Run(object):
             sls.y[sls.y < 0.0] = 0.0
             sls.std_y[sls.std_y < 1e-4 * sls.y.max()] = 1e-4 * sls.y.max()
             
-            cs_den_norm = cs_den_norm / cs_den_norm.max()
+            # Just normalize to the innermost chord:
+            cs_den_norm = cs_den_norm / cs_den_norm[:, 0].max()
             spl = scipy.interpolate.RectBivariateSpline(self.truth_data.time - self.time_1, self.truth_data.sqrtpsinorm, cs_den_norm)
             sls.y_norm[:, :] = spl(sls.t, sls.sqrtpsinorm)
             sls.std_y_norm = n * sls.y_norm
@@ -2494,7 +2497,8 @@ class Run(object):
                 spl = scipy.interpolate.RectBivariateSpline(time - self.time_1, sqrtpsinorm, cs_den[:, sls.cs_den_idx, :])
             local_sig.append(spl(sls.t, sls.sqrtpsinorm))
             if self.normalize:
-                local_sig[-1] /= local_sig[-1].max()
+                # Just normalize to the innermost chord
+                local_sig[-1] /= local_sig[-1][:, 0].max()
         
         if debug_plots:
             for s, sls in zip(local_sig, self.local_signals):
@@ -2527,7 +2531,7 @@ class Run(object):
             local_diffs.append(s - (ss.y_norm if self.normalize else ss.y))
         return local_diffs
     
-    def local_diffs2ln_prob(self, local_diffs, sign=1.0):
+    def local_diffs2ln_prob(self, local_diffs, sign=1.0, no_prior=False):
         r"""Computes the log-posterior corresponding to the given local signal differences.
         
         Here, the weighted differences :math:`\chi^2` are given as
@@ -2553,11 +2557,14 @@ class Run(object):
             Sign (or other factor) applied to the final result. Set this to -1.0
             to use this function with a minimizer, for instance. Default is 1.0
             (return actual log-posterior).
+        no_prior : bool, optional
+            If True, the log-likelihood is returned instead of the log-posterior.
+            Default is False (return log-posterior).
         
         Returns
         -------
         lp : float
-            The log-posterior.
+            The log-posterior or log-likelihood.
         """
         chi2 = 0.0
         for s, ss in zip(local_diffs, self.local_signals):
@@ -2566,7 +2573,9 @@ class Run(object):
         if chi2 == 0.0:
             return -sign * scipy.inf
         else:
-            lp = sign * (-0.5 * chi2 + self.get_prior()(self.params))
+            lp = sign * (-0.5 * chi2 + self.ll_normalization_local)
+            if not no_prior:
+                lp += sign * self.get_prior()(self.params)
             return lp
     
     # End-to-end routines:
@@ -2778,6 +2787,73 @@ class Run(object):
         if return_grad:
             print(time_.time() - start)
         return out
+    
+    # Routines for multinest:
+    def multinest_prior(self, cube, ndim, nparams):
+        """Prior distribution function for :py:mod:`pymultinest`.
+        
+        Maps the (free) parameters in `cube` from [0, 1] to real space.
+        
+        Parameters
+        ----------
+        cube : array of float, (`num_free_params`,)
+            The variables in the unit hypercube.
+        ndim : int
+            The number of dimensions (meaningful length of `cube`).
+        nparams : int
+            The number of parameters (length of `cube`).
+        """
+        # Need to use self.params so that we can handle fixed params:
+        u = self.get_prior().elementwise_cdf(self.params)
+        u[~self.fixed_params] = cube[:ndim]
+        p = self.get_prior().sample_u(u)
+        p_masked = p[~self.fixed_params]
+        for k in range(0, ndim):
+            cube[k] = p_masked[k]
+    
+    def multinest_ll_local(self, cube, ndim, nparams, lnew):
+        """Log-likelihood function for py:mod:`pymultinest`. Uses the local data.
+        
+        Parameters
+        ----------
+        cube : array of float, (`num_free_params`,)
+            The free parameters.
+        ndim : int
+            The number of dimensions (meaningful length of `cube`).
+        nparams : int
+            The number of parameters (length of `cube`).
+        lnew : float
+            New log-likelihood. Probably just there for FORTRAN compatibility?
+        """
+        c = [cube[i] for i in range(0, ndim)]
+        print(c)
+        cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(params=c)
+        local_sig = self.cs_den2local_sigs(cs_den, sqrtpsinorm, time)
+        local_diffs = self.local_sig2local_diffs(local_sig)
+        ll = self.local_diffs2ln_prob(local_diffs, no_prior=True)
+        print(ll)
+        return ll
+    
+    def run_multinest(self):
+        """Run the multinest sampler.
+        """
+        # TODO: This needs to be updated to run in parallel with MPI!
+        progress = pymultinest.ProgressPrinter(
+            n_params=(~self.fixed_params).sum(),
+            outputfiles_basename='chains/t1-'
+        )
+        progress.start()
+        pymultinest.run(
+            self.multinest_ll_local,
+            self.multinest_prior,
+            (~self.fixed_params).sum(),
+            importance_nested_sampling=False,
+            resume=True,
+            verbose=True,
+            outputfiles_basename='chains/t1-',
+            n_live_points=100
+        )
+        progress.stop()
     
     def parallel_compute_cs_den(self, D_grid, V_grid, pool):
         eval_obj = _ComputeCSDenEval(self)
@@ -4944,6 +5020,22 @@ class Run(object):
         """Returns the directory name for the given settings.
         """
         return 'strahl_%d_%d' % (self.shot, self.version)
+    
+    @property
+    def ll_normalization_local(self):
+        """Returns the normalization constant for the log-likelihood using local signals.
+        """
+        if self._ll_normalization_local is None:
+            good_err = []
+            for s in self.local_signals:
+                if self.normalize:
+                    good_err.extend(s.std_y_norm[~scipy.isnan(s.y_norm)].ravel())
+                else:
+                    good_err.extend(s.std_y[~scipy.isnan(s.y)].ravel())
+            self._ll_normalization_local = (
+                -scipy.log(good_err).sum() - 0.5 * len(good_err) * scipy.log(2.0 * scipy.pi)
+            )
+        return self._ll_normalization_local
     
     @property
     def ll_normalization(self):
