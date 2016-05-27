@@ -64,6 +64,7 @@ import nlopt
 import pymysql as MS
 import traceback
 from connect import get_connection, send_email
+import fcntl
 
 # Store the PID of the main thread:
 MAIN_PID = os.getpid()
@@ -216,8 +217,15 @@ def get_idl_session():
         IDL_SESSION.expect('IDL> ')
     return IDL_SESSION
 
-def acquire_working_dir():
+def acquire_working_dir(lockmode='pool'):
     """Get the first available working directory. If none is available, create one.
+    
+    Parameters
+    ----------
+    lockmode : {'pool', 'file'}
+        Type of lock to use. Default is to use `DIR_POOL_LOCK`. If 'file', will
+        attempt to use `flock` to acquire an exclusive lock on the working dirs
+        file.
     """
     # Some clever trickery is needed to deal with execution in the main thread
     # for connected topologies, since PaGMO seems to spawn way too many at once
@@ -229,7 +237,7 @@ def acquire_working_dir():
     global WORKING_DIR
     global MASTER_DIR
     
-    if os.getpid() == MAIN_PID:
+    if os.getpid() == MAIN_PID and lockmode == 'pool':
         # This will hammer away indefinitely until the directory is acquired,
         # trying every 10ms.
         while True:
@@ -242,24 +250,51 @@ def acquire_working_dir():
                 os.chdir(WORKING_DIR)
                 return
     else:
-        global DIR_POOL_LOCK
-        
-        with DIR_POOL_LOCK:
-            with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'r') as f:
-                lines = f.read().splitlines(True)
-            # Handle case where all directories are already taken:
-            if len(lines) == 0:
-                WORKING_DIR = tempfile.mkdtemp(prefix='bayesimp')
-                os.chdir(WORKING_DIR)
-                copy_tree(MASTER_DIR, WORKING_DIR)
-            else:
-                WORKING_DIR = lines[0][:-1]
-                os.chdir(WORKING_DIR)
-                with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'w') as f:
-                    f.writelines(lines[1:])
+        if lockmode == 'pool':
+            global DIR_POOL_LOCK
+            
+            with DIR_POOL_LOCK:
+                with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'r') as f:
+                    lines = f.read().splitlines(True)
+                # Handle case where all directories are already taken:
+                if len(lines) == 0:
+                    WORKING_DIR = tempfile.mkdtemp(prefix='bayesimp')
+                    os.chdir(WORKING_DIR)
+                    copy_tree(MASTER_DIR, WORKING_DIR)
+                else:
+                    WORKING_DIR = lines[0][:-1]
+                    os.chdir(WORKING_DIR)
+                    with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'w') as f:
+                        f.writelines(lines[1:])
+        elif lockmode == 'file':
+            fl = open(os.path.join(MASTER_DIR, 'lockfile'), 'r')
+            fcntl.flock(fl.fileno(), fcntl.LOCK_EX)
+            try:
+                with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'r') as f:
+                    lines = f.read().splitlines(True)
+                # Handle case where all directories are already taken:
+                if len(lines) == 0:
+                    WORKING_DIR = tempfile.mkdtemp(prefix='bayesimp')
+                    os.chdir(WORKING_DIR)
+                    copy_tree(MASTER_DIR, WORKING_DIR)
+                else:
+                    WORKING_DIR = lines[0][:-1]
+                    os.chdir(WORKING_DIR)
+                    with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'w') as f:
+                        f.writelines(lines[1:])
+            finally:
+                fcntl.flock(fl.fileno(), fcntl.LOCK_UN)
+                fl.close()
 
-def release_working_dir():
+def release_working_dir(lockmode='pool'):
     """Release the current working directory, adding its name back onto the list of available ones.
+    
+    Parameters
+    ----------
+    lockmode : {'pool', 'file'}
+        Type of lock to use. Default is to use `DIR_POOL_LOCK`. If 'file', will
+        attempt to use `flock` to acquire an exclusive lock on the working dirs
+        file.
     """
     global WORKING_DIR
     global MASTER_DIR
@@ -271,17 +306,28 @@ def release_working_dir():
     # use. If it has one element, the main directory can be used. So, to acquire
     # the directory you pop (an atomic operation) and to release it you append
     # (also an atomic operation).
-    if os.getpid() == MAIN_PID:
+    if os.getpid() == MAIN_PID and lockmode == 'pool':
         # Append is atomic, so I can safely just push this back on:
         MAIN_THREAD_DIRS.append(None)
     else:
-        global DIR_POOL_LOCK
-        
-        with DIR_POOL_LOCK:
-            with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'a') as f:
-                f.write(WORKING_DIR + '\n')
-        
-        os.chdir(MASTER_DIR)
+        if lockmode == 'pool':
+            global DIR_POOL_LOCK
+            
+            with DIR_POOL_LOCK:
+                with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'a') as f:
+                    f.write(WORKING_DIR + '\n')
+            
+            os.chdir(MASTER_DIR)
+        elif lockmode == 'file':
+            fl = open(os.path.join(MASTER_DIR, 'lockfile'), 'r')
+            fcntl.flock(fl.fileno(), fcntl.LOCK_EX)
+            try:
+                with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'a') as f:
+                    f.write(WORKING_DIR + '\n')
+                os.chdir(MASTER_DIR)
+            finally:
+                fcntl.flock(fl.fileno(), fcntl.LOCK_UN)
+                fl.close()
 
 def setup_working_dir(*args, **kwargs):
     """Setup a temporary working directory, and store its name in WORKING_DIR.
@@ -2825,8 +2871,7 @@ class Run(object):
         lnew : float
             New log-likelihood. Probably just there for FORTRAN compatibility?
         """
-        # TODO: Update these functions to work right!
-        acquire_working_dir()
+        acquire_working_dir(lockmode='file')
         try:
             c = [cube[i] for i in range(0, ndim)]
             cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(params=c)
@@ -2834,12 +2879,14 @@ class Run(object):
             local_diffs = self.local_sig2local_diffs(local_sig)
             ll = self.local_diffs2ln_prob(local_diffs, no_prior=True)
         finally:
-            release_working_dir()
+            release_working_dir(lockmode='file')
         return ll
     
     def run_multinest(self):
         """Run the multinest sampler.
         """
+        if not os.path.exists("chains"):
+            os.mkdir("chains")
         progress = pymultinest.ProgressPrinter(
             n_params=(~self.fixed_params).sum(),
             outputfiles_basename='chains/t1-'
@@ -2856,6 +2903,12 @@ class Run(object):
             n_live_points=100
         )
         progress.stop()
+    
+    def process_multinest(self):
+        a = pymultinest.Analyzer(n_params=~(self.fixed_params).sum(), outputfiles_basename='chains/t1-')
+        data = a.get_data()
+        gptools.plot_sampler(data[:, 2:], weights=data[:, 0], labels=self.free_param_names, chain_alpha=1.0, cutoff_weight=0.1)
+        return a
     
     def parallel_compute_cs_den(self, D_grid, V_grid, pool):
         eval_obj = _ComputeCSDenEval(self)
