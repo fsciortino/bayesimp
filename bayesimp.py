@@ -2825,19 +2825,21 @@ class Run(object):
         lnew : float
             New log-likelihood. Probably just there for FORTRAN compatibility?
         """
-        c = [cube[i] for i in range(0, ndim)]
-        print(c)
-        cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(params=c)
-        local_sig = self.cs_den2local_sigs(cs_den, sqrtpsinorm, time)
-        local_diffs = self.local_sig2local_diffs(local_sig)
-        ll = self.local_diffs2ln_prob(local_diffs, no_prior=True)
-        print(ll)
+        # TODO: Update these functions to work right!
+        acquire_working_dir()
+        try:
+            c = [cube[i] for i in range(0, ndim)]
+            cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(params=c)
+            local_sig = self.cs_den2local_sigs(cs_den, sqrtpsinorm, time)
+            local_diffs = self.local_sig2local_diffs(local_sig)
+            ll = self.local_diffs2ln_prob(local_diffs, no_prior=True)
+        finally:
+            release_working_dir()
         return ll
     
     def run_multinest(self):
         """Run the multinest sampler.
         """
-        # TODO: This needs to be updated to run in parallel with MPI!
         progress = pymultinest.ProgressPrinter(
             n_params=(~self.fixed_params).sum(),
             outputfiles_basename='chains/t1-'
