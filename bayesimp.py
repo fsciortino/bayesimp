@@ -7186,37 +7186,40 @@ class _ComputeCSDenEval(object):
         self.run = run
     
     def __call__(self, DV):
-        p = scipy.concatenate((DV, [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.0, 0.0, 0.0]))
-        cs_den, sqrtpsinorm, time, ne, Te = self.run.DV2cs_den(p)
+        try:
+            cs_den, sqrtpsinorm, time, ne, Te = self.run.DV2cs_den(DV)
+        except:
+            print("Failure!")
+            return None
         
         res = _CSDenResult(DV)
         
         # For each charge state and location:
         i_peak_local = cs_den.argmax(axis=0)
-        res.t_cs_den_peak_local = self.run.truth_data.time[i_peak_local]
+        res.t_cs_den_peak_local = time[i_peak_local]
         res.cs_den_peak_local = cs_den.max(axis=0)
         
         # For each charge state across all locations:
         i_peak_global = res.cs_den_peak_local.argmax(axis=1)
         res.t_cs_den_peak_global = res.t_cs_den_peak_local[range(cs_den.shape[1]), i_peak_global]
         res.cs_den_peak_global = res.cs_den_peak_local.max(axis=1)
-        res.sqrtpsinorm_cs_den_peak_global = self.run.truth_data.sqrtpsinorm[i_peak_global]
+        res.sqrtpsinorm_cs_den_peak_global = sqrtpsinorm[i_peak_global]
         
         # For total impurity density at each location:
         n = cs_den.sum(axis=1) # shape is (`n_time`, `n_space`)
         i_n_peak_local = n.argmax(axis=0)
-        res.t_n_peak_local = self.run.truth_data.time[i_n_peak_local]
+        res.t_n_peak_local = time[i_n_peak_local]
         res.n_peak_local = n.max(axis=0)
         
         # For total impurity density across all locations:
         i_n_peak_global = res.n_peak_local.argmax()
         res.t_n_peak_global = res.t_n_peak_local[i_n_peak_global]
         res.n_peak_global = res.n_peak_local[i_n_peak_global]
-        res.sqrtpsinorm_n_peak_global = self.run.truth_data.sqrtpsinorm[i_n_peak_global]
+        res.sqrtpsinorm_n_peak_global = sqrtpsinorm[i_n_peak_global]
         
         # For total impurity content inside the LCFS:
         volnorm_grid = self.run.efit_tree.psinorm2volnorm(
-            self.run.truth_data.sqrtpsinorm**2.0,
+            sqrtpsinorm**2.0,
             (self.run.time_1 + self.run.time_2) / 2.0
         )
         V = self.run.efit_tree.psinorm2v(1.0, (self.run.time_1 + self.run.time_2) / 2.0)
@@ -7226,7 +7229,7 @@ class _ComputeCSDenEval(object):
         # Use the trapezoid rule:
         N = V * 0.5 * ((volnorm_grid[1:] - volnorm_grid[:-1]) * (nn[:, 1:] + nn[:, :-1])).sum(axis=1)
         i_N_peak = N.argmax()
-        res.t_N_peak = self.run.truth_data.time[i_N_peak]
+        res.t_N_peak = time[i_N_peak]
         res.N_peak = N[i_N_peak]
         
         # # Confinement time for each charge state and each location:
@@ -7252,14 +7255,22 @@ class _ComputeCSDenEval(object):
         #         theta, dum1, dum2, dum3 = scipy.linalg.lstsq(X.T.dot(X), X.T.dot(scipy.log(n[t_mask, s_idx])))
         #         res.tau_n_local[s_idx] = -1.0 / theta[1]
         
-        # Confinement time of total impurity content:
-        t_mask = (self.run.truth_data.time > res.t_N_peak + 0.01) & (N > 0.0) & (~scipy.isinf(N)) & (~scipy.isnan(N))
+        # Confinement time of total impurity content and shape factor:
+        t_mask = (time > res.t_N_peak + 0.01) & (N > 0.0) & (~scipy.isinf(N)) & (~scipy.isnan(N))
         if t_mask.sum() < 2:
             res.tau_N = 0.0
+            res.n075n0 = scipy.median(n[:, 62] / n[:, 0])
+            res.prof = scipy.nanmedian(n / n[:, 0][:, None], axis=0)
         else:
-            X = scipy.hstack((scipy.ones((t_mask.sum(), 1)), scipy.atleast_2d(self.run.truth_data.time[t_mask]).T))
+            X = scipy.hstack((scipy.ones((t_mask.sum(), 1)), scipy.atleast_2d(time[t_mask]).T))
             theta, dum1, dum2, dum3 = scipy.linalg.lstsq(X.T.dot(X), X.T.dot(scipy.log(N[t_mask])))
             res.tau_N = -1.0 / theta[1]
+            
+            first_t_idx = scipy.where(t_mask)[0][0]
+            # Take the median just in case I didn't wait until far enough after
+            # the peak:
+            res.n075n0 = scipy.median(n[first_t_idx:, 62] / n[first_t_idx:, 0])
+            res.prof = scipy.nanmedian(n[first_t_idx:, :] / n[first_t_idx:, 0][:, None], axis=0)
         
         return res
 
