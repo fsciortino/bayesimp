@@ -585,6 +585,28 @@ class Run(object):
         time, only the indicated synthetic signals will be created. If passed
         when restoring a run, will simply remove the synthetic signals from the
         inference.
+    noise_type: {'proportional Gaussian', 'Poisson'}
+        The noise type to use. Options are:
+        
+        * 'proportional Gaussian': Gaussian noise for which the standard
+          deviation is equal to the relative noise level times the value.
+        * 'Poisson' : Gaussian noise for which the standard deviation is
+          equal to the relative noise level times the value divided by the
+          square root of the ratio of the value to the max value. This
+          simulates Poisson noise.
+    shift_prior : :py:class:`gptools.JointPrior` instance, optional
+        The prior distribution to use for the time shifts for each diagnostic.
+        Default is zero-mean Gaussian priors with 2ms standard deviation.
+    explicit_D : array of float, (`M`,), optional
+        Explicit values of D to construct the truth data with. Overrides the D
+        coefficient parts of `params_true`.
+    explicit_D_grid : array of float, (`M`,), optional
+        The grid the explicit values of D are given on.
+    explicit_V : array of float, (`M`,), optional
+        Explicit values of V to construct the truth data with. Overrides the V
+        coefficient parts of `params_true`.
+    explicit_V_grid : array of float, (`M`,), optional
+        The grid the explicit values of V are given on.
     """
     def __init__(
             self,
@@ -643,7 +665,11 @@ class Run(object):
             free_Te=False,
             signal_mask=[True, True, True],
             noise_type='proportional Gaussian',
-            shift_prior=None
+            shift_prior=None,
+            explicit_D=None,
+            explicit_D_grid=None,
+            explicit_V=None,
+            explicit_V_grid=None
         ):
         
         global MASTER_DIR
@@ -670,6 +696,10 @@ class Run(object):
         self.include_loweus = bool(include_loweus)
         self.normalize = bool(normalize)
         self.params_true = scipy.asarray(params_true, dtype=float) if params_true is not None else None
+        self.explicit_D = scipy.asarray(explicit_D, dtype=float) if explicit_D is not None else None
+        self.explicit_D_grid = scipy.asarray(explicit_D_grid, dtype=float) if explicit_D_grid is not None else None
+        self.explicit_V = scipy.asarray(explicit_V, dtype=float) if explicit_V is not None else None
+        self.explicit_V_grid = scipy.asarray(explicit_V_grid, dtype=float) if explicit_V_grid is not None else None
         self.sort_knots = bool(sort_knots)
         self.noise_type = noise_type
         
@@ -830,7 +860,14 @@ class Run(object):
                 # must be done here.
                 self.params = self.params_true.copy()
                 self.fixed_params = scipy.zeros_like(self.params, dtype=bool)
-                cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(self.params_true, debug_plots=debug_plots)
+                cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(
+                    self.params_true,
+                    debug_plots=debug_plots,
+                    explicit_D=self.explicit_D,
+                    explicit_D_grid=self.explicit_D_grid,
+                    explicit_V=self.explicit_V,
+                    explicit_V_grid=self.explicit_V_grid
+                )
                 
                 if use_local:
                     # Local:
@@ -947,7 +984,15 @@ class Run(object):
                             ss.y = s
                     
                     # Now for Ar:
-                    cs_den_ar, sqrtpsinorm, time_ar, ne, Te = self.DV2cs_den(self.params_true, debug_plots=debug_plots, steady_ar=1e15)
+                    cs_den_ar, sqrtpsinorm, time_ar, ne, Te = self.DV2cs_den(
+                        self.params_true,
+                        debug_plots=debug_plots,
+                        steady_ar=1e15,
+                        explicit_D=self.explicit_D,
+                        explicit_D_grid=self.explicit_D_grid,
+                        explicit_V=self.explicit_V,
+                        explicit_V_grid=self.explicit_V_grid
+                    )
                     dlines_ar = self.cs_den2dlines(cs_den_ar, sqrtpsinorm, time_ar, ne, Te, debug_plots=debug_plots, steady_ar=1e15)
                     sig_abs_ar = self.dlines2sig(dlines_ar, time_ar, debug_plots=debug_plots, steady_ar=1e15)
                     self.ar_signal.y[:, :] = sig_abs_ar
@@ -974,14 +1019,18 @@ class Run(object):
                         cs_den,
                         time,
                         sqrtpsinorm,
-                        dlines,
-                        sig_abs,
-                        sig_norm,
-                        cs_den_ar,
-                        dlines_ar,
-                        sig_abs_ar,
-                        sig_norm_ar,
-                        time_ar
+                        dlines=dlines,
+                        sig_abs=sig_abs,
+                        sig_norm=sig_norm,
+                        cs_den_ar=cs_den_ar,
+                        dlines_ar=dlines_ar,
+                        sig_abs_ar=sig_abs_ar,
+                        sig_norm_ar=sig_norm_ar,
+                        time_ar=time_ar,
+                        explicit_D=self.explicit_D,
+                        explicit_D_grid=self.explicit_D_grid,
+                        explicit_V=self.explicit_V,
+                        explicit_V_grid=self.explicit_V_grid
                     )
                 else:
                     self.ar_signal=None
@@ -989,7 +1038,11 @@ class Run(object):
                         params_true,
                         cs_den,
                         time,
-                        sqrtpsinorm
+                        sqrtpsinorm,
+                        explicit_D=self.explicit_D,
+                        explicit_D_grid=self.explicit_D_grid,
+                        explicit_V=self.explicit_V,
+                        explicit_V_grid=self.explicit_V_grid
                     )
                 with open('truth_data.pkl', 'wb') as f:
                     pkl.dump(self.truth_data, f, protocol=pkl.HIGHEST_PROTOCOL)
@@ -6476,6 +6529,10 @@ class TruthData(object):
             cs_den,
             time,
             sqrtpsinorm,
+            explicit_D=None,
+            explicit_D_grid=None,
+            explicit_V=None,
+            explicit_V_grid=None,
             dlines=None,
             sig_abs=None,
             sig_norm=None,
@@ -6497,6 +6554,10 @@ class TruthData(object):
         self.sig_abs_ar = sig_abs_ar
         self.sig_norm_ar = sig_norm_ar
         self.time_ar = time_ar
+        self.explicit_D = explicit_D
+        self.explicit_D_grid = explicit_D_grid
+        self.explicit_V = explicit_V
+        self.explicit_V_grid = explicit_V_grid
 
 class Injection(object):
     """Class to store information on a given injection.
