@@ -267,7 +267,8 @@ def acquire_working_dir(lockmode='pool'):
                     with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'w') as f:
                         f.writelines(lines[1:])
         elif lockmode == 'file':
-            fl = open(os.path.join(MASTER_DIR, 'lockfile'), 'r')
+            # Need to open for writing for this to work on Linux:
+            fl = open(os.path.join(MASTER_DIR, 'lockfile'), 'a')
             fcntl.flock(fl.fileno(), fcntl.LOCK_EX)
             try:
                 with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'r') as f:
@@ -319,7 +320,8 @@ def release_working_dir(lockmode='pool'):
             
             os.chdir(MASTER_DIR)
         elif lockmode == 'file':
-            fl = open(os.path.join(MASTER_DIR, 'lockfile'), 'r')
+            # Need to open for writing for this to work on Linux:
+            fl = open(os.path.join(MASTER_DIR, 'lockfile'), 'a')
             fcntl.flock(fl.fileno(), fcntl.LOCK_EX)
             try:
                 with open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'a') as f:
@@ -1520,6 +1522,9 @@ class Run(object):
         plot : bool, optional
             If True, a plot of D and V will be produced. Default is False.
         """
+        # Hack to make it work with older matplotlib on psfcstor1:
+        if matplotlib.__version__ == '1.3.1' and lc is None:
+            lc = 'b'
         if params is not None:
             params = scipy.asarray(params, dtype=float)
             if len(params) == self.num_params:
@@ -2046,7 +2051,12 @@ class Run(object):
             
             f = plt.figure()
             a = f.add_subplot(1, 1, 1)
-            pcm = a.pcolormesh(sqrtpsinorm, time, cs_den.sum(axis=1), cmap='plasma', vmax=cs_den.sum(axis=1)[:, 0].max())
+            # Hack for older matplotlib:
+            if matplotlib.__version__ == '1.3.1':
+                cmap = 'gray_r'
+            else:
+                cmap = 'plasma'
+            pcm = a.pcolormesh(sqrtpsinorm, time, cs_den.sum(axis=1), cmap=cmap, vmax=cs_den.sum(axis=1)[:, 0].max())
             pcm.cmap.set_over('white')
             f.colorbar(pcm, extend='max')
             a.set_xlabel(r"$\sqrt{\psi_{\mathrm{n}}}$")
@@ -2934,7 +2944,7 @@ class Run(object):
                     no_prior=no_prior
                 )
         except:
-            warnings.warn("Failed evaluation!")
+            warnings.warn("Failed evaluation! Exception was:\n" + traceback.format_exc())
             return -sign * scipy.inf
     
     def u2ln_prob(
