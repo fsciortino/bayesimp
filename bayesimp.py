@@ -65,6 +65,7 @@ import pymysql as MS
 import traceback
 from connect import get_connection, send_email
 import fcntl
+import sobol
 
 # Store the PID of the main thread:
 MAIN_PID = os.getpid()
@@ -671,7 +672,9 @@ class Run(object):
             explicit_D=None,
             explicit_D_grid=None,
             explicit_V=None,
-            explicit_V_grid=None
+            explicit_V_grid=None,
+            use_PMMCMC=False,
+            num_pts_PMMCMC=100
         ):
         
         global MASTER_DIR
@@ -685,6 +688,7 @@ class Run(object):
         self._ll_normalization = None
         self._ar_ll_normalization = None
         
+        self.use_PMMCMC = bool(use_PMMCMC)
         self.signal_mask = scipy.asarray(signal_mask, dtype=bool)
         self.shot = int(shot)
         self.version = int(version)
@@ -1086,6 +1090,27 @@ class Run(object):
             self.use_shift = use_shift
             self.free_ne = free_ne
             self.free_Te = free_Te
+        
+        # Set up the grids for PMMCMC:
+        # Here I will use quasi Monte Carlo importance sampling, but the
+        # implementation is done in a way that makes it trivial to switch to
+        # sparse grid quadrature at a later date.
+        if self.use_PMMCMC:
+            num_pts_PMMCMC = int(num_pts_PMMCMC)
+            self.dt_quad_arr = scipy.zeros((num_pts_PMMCMC, self.signal_mask.sum()))
+            self.ln_dt_quad_wt = scipy.zeros(num_pts_PMMCMC)
+            for i in range(0, num_pts_PMMCMC):
+                q, dum = sobol.i4_sobol(self.signal_mask.sum(), i)
+                # Pad this out to the point that I can use the source_prior:
+                u = 0.5 * scipy.ones(len(self.signals))
+                u[self.signal_mask] = q
+                p = self.shift_prior.sample_u(u)
+                self.dt_quad_arr[i, :] = p[self.signal_mask]
+                self.ln_dt_quad_wt[i] = -self.shift_prior(p)
+            # Mask out the inf/nan values:
+            mask = (scipy.isinf(self.dt_quad_arr).any(axis=1)) | (scipy.isnan(self.dt_quad_arr).any(axis=1))
+            self.dt_quad_arr = self.dt_quad_arr[~mask, :]
+            self.ln_dt_quad_wt = self.ln_dt_quad_wt[~mask] - scipy.log(~mask.sum())
     
     @property
     def num_params(self):
@@ -2381,6 +2406,80 @@ class Run(object):
             # print(lp)
             return lp
     
+    def dlines2ln_prob_marg(self, dlines, time, params=None, debug_plots=False, **kwargs):
+        """Convert the given diagnostic lines to marginalized log-posterior.
+        
+        Marginalizes over the time shifts using quasi Monte Carlo importance
+        sampling.
+        
+        Parameters
+        ----------
+        dlines : array of float, (`n_time`, `n_lines`, `n_space`)
+            The spatial profiles of local emissivities.
+        time : array of float, (`n_time`,)
+            The time grid which `dlines` is given on.
+        params : array of float
+            The parameters to use. If absent, :py:attr:`self.params` is used.
+        debug_plots : bool, optional
+            If True, plots of the various steps will be generated. Default is
+            False (do not produce plots).
+        **kwargs : optional keywords
+            All additional keywords are passed to each call to
+            :py:meth:`self.dlines2ln_prob`.
+        """
+        if params is not None:
+            params = scipy.asarray(params, dtype=float)
+            if len(params) == self.num_params:
+                self.params = params
+            else:
+                self.free_params = params
+        
+        nD = self.num_eig_D
+        nV = self.num_eig_V
+        kD = self.spline_k_D
+        kV = self.spline_k_V
+        nkD = self.num_eig_D - self.spline_k_D
+        nkV = self.num_eig_V - self.spline_k_V
+        
+        # Number of signals (determines number of scaling parameters):
+        nS = 0
+        for s in self.signals:
+            if s is not None:
+                nS += len(scipy.unique(s.blocks))
+        
+        # Number of diagnostics (determines number of time shifts):
+        nDiag = len(self.signals)
+        
+        # Mask for where the active time shifts are:
+        mask = scipy.arange(nD + nV + nkD + nkV + nS, nD + nV + nkD + nkV + nS + nDiag)[self.signal_mask]
+        
+        # Store the QMC points as an (NPTS, NDIM) array:
+        ln_prob = scipy.zeros(self.dt_quad_arr.shape[0])
+        for i in range(0, self.dt_quad_arr.shape[0]):
+            self.params[mask] = self.dt_quad_arr[i]
+            ln_prob[i] = self.dlines2ln_prob(dlines, time, debug_plots=debug_plots > 1, **kwargs) + self.ln_dt_quad_wt[i]
+        
+        # Apply the log-sum-exp trick:
+        A = ln_prob.max()
+        lp = scipy.log(scipy.exp(ln_prob - A).sum()) + A
+        
+        if debug_plots:
+            f = plt.figure()
+            a = f.add_subplot(1, 1, 1)
+            a.hist2d(self.dt_quad_arr[:, 0], self.dt_quad_arr[:, 1], 20, weights=scipy.exp(ln_prob))
+            
+            f = plt.figure()
+            a = f.add_subplot(1, 1, 1)
+            a.hist2d(self.dt_quad_arr[:, 0], self.dt_quad_arr[:, 1], 20)
+            
+            for i in range(0, self.dt_quad_arr.shape[1]):
+                srt = self.dt_quad_arr[:, i].argsort()
+                f = plt.figure()
+                a = f.add_subplot(1, 1, 1)
+                a.plot(self.dt_quad_arr[srt, i], ln_prob[srt] - self.ln_dt_quad_wt[srt], '.-')
+                a.set_title('%d' % (i,))
+        
+        return lp
     
     # The following are all wrapper functions. I explicitly copied the arguments
     # over for the function fingerprints, SO THESE MUST BE CAREFULLY UPDATED
