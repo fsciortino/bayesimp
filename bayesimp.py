@@ -1098,19 +1098,17 @@ class Run(object):
         if self.use_PMMCMC:
             num_pts_PMMCMC = int(num_pts_PMMCMC)
             self.dt_quad_arr = scipy.zeros((num_pts_PMMCMC, self.signal_mask.sum()))
-            self.ln_dt_quad_wt = scipy.zeros(num_pts_PMMCMC)
             for i in range(0, num_pts_PMMCMC):
-                q, dum = sobol.i4_sobol(self.signal_mask.sum(), i)
+                # start from 1 to not include the -inf point:
+                q, dum = sobol.i4_sobol(self.signal_mask.sum(), i + 1)
                 # Pad this out to the point that I can use the source_prior:
                 u = 0.5 * scipy.ones(len(self.signals))
                 u[self.signal_mask] = q
                 p = self.shift_prior.sample_u(u)
                 self.dt_quad_arr[i, :] = p[self.signal_mask]
-                self.ln_dt_quad_wt[i] = -self.shift_prior(p)
             # Mask out the inf/nan values:
             mask = (scipy.isinf(self.dt_quad_arr).any(axis=1)) | (scipy.isnan(self.dt_quad_arr).any(axis=1))
             self.dt_quad_arr = self.dt_quad_arr[~mask, :]
-            self.ln_dt_quad_wt = self.ln_dt_quad_wt[~mask] - scipy.log(~mask.sum())
     
     @property
     def num_params(self):
@@ -2190,7 +2188,7 @@ class Run(object):
         
         return dlines
     
-    def dlines2sig(self, dlines, time, params=None, steady_ar=None, debug_plots=False):
+    def dlines2sig(self, dlines, time, params=None, steady_ar=None, debug_plots=False, sigsplines=None):
         """Computes the diagnostic signals corresponding to the given local emissivities.
         
         Takes each signal in :py:attr:`self.signals`, applies the weights (if
@@ -2223,36 +2221,20 @@ class Run(object):
         
         eig_D, eig_V, knots_D, knots_V, param_scaling, param_source, eig_ne, eig_Te = self.split_params()
         
-        time = time - self.time_1
-        # Apply the diagnostic time shifts:
-        times = [time - dt for dt in param_source[:len(self.signals)]]
-        
         if steady_ar is None:
+            if sigsplines is None:
+                sigsplines = self.dlines2sigsplines(dlines, time)
+            
             sig = []
             # k is the index of the current block in param_scaling:
             k = 0
-            for j, s in enumerate(self.signals):
+            for j, (s, sspl) in enumerate(zip(self.signals, sigsplines)):
                 if s is not None and self.signal_mask[j]:
                     out_arr = scipy.zeros_like(s.y)
                     # Use postinj to zero out before the injection:
                     postinj = s.t >= -param_source[j]
                     for i in range(0, s.y.shape[1]):
-                        # TODO: This should be moved outside the loop if possible!
-                        if s.weights is not None:
-                            sigl = dlines[:, s.atomdat_idx[i], :].dot(s.weights[i, :])
-                        else:
-                            raise NotImplementedError("Local signals must be handled separately!")
-                            sigl = dlines[:, s.atomdat_idx[i], :]
-                        out_arr[postinj, i] = scipy.interpolate.InterpolatedUnivariateSpline(
-                            times[j],
-                            sigl
-                        )(s.t[postinj])
-                        if debug_plots > 1:
-                            f = plt.figure()
-                            a = f.add_subplot(1, 1, 1)
-                            a.plot(times[j], sigl, '.')
-                            a.plot(s.t[postinj], out_arr[postinj, i], '+')
-                            a.plot(s.t, s.y[:, i], 'o')
+                        out_arr[postinj, i] = sspl[i](s.t[postinj] + param_source[j])
                     # Do the normalization and scaling for each block:
                     for b in scipy.unique(s.blocks):
                         mask = s.blocks == b
@@ -2406,7 +2388,23 @@ class Run(object):
             # print(lp)
             return lp
     
-    def dlines2ln_prob_marg(self, dlines, time, params=None, debug_plots=False, **kwargs):
+    def dlines2sigsplines(self, dlines, time):
+        """Convert the given diagnostic lines to splines which can be used to interpolate onto the diagnostic timebase.
+        """
+        time = time - self.time_1
+        
+        return [
+            [
+                scipy.interpolate.InterpolatedUnivariateSpline(
+                    time,
+                    dlines[:, s.atomdat_idx[i], :].dot(s.weights[i, :])
+                )
+                for i in range(0, s.y.shape[1])
+            ]
+            for j, s in enumerate(self.signals)
+        ]
+    
+    def dlines2ln_prob_marg(self, dlines, time, params=None, debug_plots=False, no_prior=False, **kwargs):
         """Convert the given diagnostic lines to marginalized log-posterior.
         
         Marginalizes over the time shifts using quasi Monte Carlo importance
@@ -2434,6 +2432,8 @@ class Run(object):
             else:
                 self.free_params = params
         
+        sigsplines = self.dlines2sigsplines(dlines, time)
+        
         nD = self.num_eig_D
         nV = self.num_eig_V
         kD = self.spline_k_D
@@ -2453,31 +2453,42 @@ class Run(object):
         # Mask for where the active time shifts are:
         mask = scipy.arange(nD + nV + nkD + nkV + nS, nD + nV + nkD + nkV + nS + nDiag)[self.signal_mask]
         
-        # Store the QMC points as an (NPTS, NDIM) array:
+        # The QMC points are stored as an (NPTS, NDIM) array:
         ln_prob = scipy.zeros(self.dt_quad_arr.shape[0])
+        if debug_plots:
+            ln_fz = scipy.zeros(self.dt_quad_arr.shape[0])
         for i in range(0, self.dt_quad_arr.shape[0]):
             self.params[mask] = self.dt_quad_arr[i]
-            ln_prob[i] = self.dlines2ln_prob(dlines, time, debug_plots=debug_plots > 1, **kwargs) + self.ln_dt_quad_wt[i]
+            ln_prob[i] = self.dlines2ln_prob(
+                dlines,
+                time,
+                debug_plots=debug_plots > 1,
+                no_prior=True,
+                sigsplines=sigsplines,
+                **kwargs
+            )
+            if debug_plots:
+                ln_fz[i] = self.shift_prior(self.params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag])
         
         # Apply the log-sum-exp trick:
         A = ln_prob.max()
-        lp = scipy.log(scipy.exp(ln_prob - A).sum()) + A
+        lp = scipy.log(scipy.exp(ln_prob - A).sum()) + A - scipy.log(len(ln_prob))
+        if not no_prior:
+            lp += self.get_prior()(self.params) - self.shift_prior(self.params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag])
         
         if debug_plots:
-            f = plt.figure()
-            a = f.add_subplot(1, 1, 1)
-            a.hist2d(self.dt_quad_arr[:, 0], self.dt_quad_arr[:, 1], 20, weights=scipy.exp(ln_prob))
-            
-            f = plt.figure()
-            a = f.add_subplot(1, 1, 1)
-            a.hist2d(self.dt_quad_arr[:, 0], self.dt_quad_arr[:, 1], 20)
-            
-            for i in range(0, self.dt_quad_arr.shape[1]):
-                srt = self.dt_quad_arr[:, i].argsort()
+            if len(mask) == 1:
                 f = plt.figure()
                 a = f.add_subplot(1, 1, 1)
-                a.plot(self.dt_quad_arr[srt, i], ln_prob[srt] - self.ln_dt_quad_wt[srt], '.-')
-                a.set_title('%d' % (i,))
+                a.plot(self.dt_quad_arr[:, 0], ln_prob + ln_fz, 'o')
+            elif len(mask) == 2:
+                # Interpolate to regular grid:
+                dt0 = scipy.linspace(self.dt_quad_arr[:, 0].min(), self.dt_quad_arr[:, 0].max(), 100)
+                dt1 = scipy.linspace(self.dt_quad_arr[:, 1].min(), self.dt_quad_arr[:, 1].max(), 101)
+                ln_fz_interp = scipy.interpolate.griddata(self.dt_quad_arr, ln_prob + ln_fz, (dt0[None, :], dt1[:, None]))
+                f = plt.figure()
+                a = f.add_subplot(1, 1, 1)
+                a.contourf(dt0, dt1, ln_fz_interp, 25)
         
         return lp
     
@@ -2719,7 +2730,9 @@ class Run(object):
             steady_ar=None,
             debug_plots=False,
             d_weights=[1.0, 1.0, 1.0],
-            sign=1.0
+            sign=1.0,
+            no_prior=False,
+            sigsplines=None
         ):
         """Computes the log-posterior corresponding to the given local emissivities.
         
@@ -2733,6 +2746,7 @@ class Run(object):
             params=params,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
+            sigsplines=sigsplines
         )
         sig_diff = self.sig2diffs(sig, steady_ar=steady_ar)
         return self.diffs2ln_prob(
@@ -2740,7 +2754,8 @@ class Run(object):
             params=params,
             steady_ar=steady_ar,
             d_weights=d_weights,
-            sign=sign
+            sign=sign,
+            no_prior=no_prior
         )
     
     def DV2diffs(
