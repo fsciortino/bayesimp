@@ -16,6 +16,7 @@ import scipy.io
 import scipy.interpolate
 import scipy.optimize
 import numpy.random
+import numpy.polynomial
 import MDSplus
 import matplotlib
 matplotlib.use('TkAgg')
@@ -66,6 +67,7 @@ import traceback
 from connect import get_connection, send_email
 import fcntl
 import sobol
+import numdifftools as nd
 
 # Store the PID of the main thread:
 MAIN_PID = os.getpid()
@@ -610,6 +612,18 @@ class Run(object):
         coefficient parts of `params_true`.
     explicit_V_grid : array of float, (`M`,), optional
         The grid the explicit values of V are given on.
+    use_PMMCMC : bool, optional
+        If True, use pseudo-marginal nested sampling to handle the time shift
+        parameters. Default is False (either hold fixed or sample full
+        posterior).
+    num_pts_PMMCMC : int, optional
+        Number of points to use when evaluating the marginal distribution with
+        pseudo-marginal nested sampling. Default is 10.
+    method_PMMCMC : {'QMC', 'GHQ'}, optional
+        Method to use when computing the marginal distribution with
+        pseudo-marginal nested sampling. Default is 'QMC' (use quasi Monte Carlo
+        sampling with a Sobol sequence). The other valid option is 'GHQ' (use
+        Gauss-Hermite quadrature with a dense tensor product grid).
     """
     def __init__(
             self,
@@ -674,7 +688,8 @@ class Run(object):
             explicit_V=None,
             explicit_V_grid=None,
             use_PMMCMC=False,
-            num_pts_PMMCMC=100
+            num_pts_PMMCMC=10,
+            method_PMMCMC='QMC'
         ):
         
         global MASTER_DIR
@@ -1096,19 +1111,31 @@ class Run(object):
         # implementation is done in a way that makes it trivial to switch to
         # sparse grid quadrature at a later date.
         if self.use_PMMCMC:
+            self.method_PMMCMC = str(method_PMMCMC)
             num_pts_PMMCMC = int(num_pts_PMMCMC)
-            self.dt_quad_arr = scipy.zeros((num_pts_PMMCMC, self.signal_mask.sum()))
-            for i in range(0, num_pts_PMMCMC):
-                # start from 1 to not include the -inf point:
-                q, dum = sobol.i4_sobol(self.signal_mask.sum(), i + 1)
-                # Pad this out to the point that I can use the source_prior:
-                u = 0.5 * scipy.ones(len(self.signals))
-                u[self.signal_mask] = q
-                p = self.shift_prior.sample_u(u)
-                self.dt_quad_arr[i, :] = p[self.signal_mask]
-            # Mask out the inf/nan values:
-            mask = (scipy.isinf(self.dt_quad_arr).any(axis=1)) | (scipy.isnan(self.dt_quad_arr).any(axis=1))
-            self.dt_quad_arr = self.dt_quad_arr[~mask, :]
+            if self.method_PMMCMC == 'QMC':
+                self.dt_quad_arr = scipy.zeros((num_pts_PMMCMC, self.signal_mask.sum()))
+                for i in range(0, num_pts_PMMCMC):
+                    # start from 1 to not include the -inf point:
+                    q, dum = sobol.i4_sobol(self.signal_mask.sum(), i + 1)
+                    # Pad this out to the point that I can use the source_prior:
+                    u = 0.5 * scipy.ones(len(self.signals))
+                    u[self.signal_mask] = q
+                    p = self.shift_prior.sample_u(u)
+                    self.dt_quad_arr[i, :] = p[self.signal_mask]
+                # Mask out the inf/nan values:
+                mask = (scipy.isinf(self.dt_quad_arr).any(axis=1)) | (scipy.isnan(self.dt_quad_arr).any(axis=1))
+                self.dt_quad_arr = self.dt_quad_arr[~mask, :]
+            elif self.method_PMMCMC == 'GHQ':
+                if not isinstance(self.shift_prior, gptools.NormalJointPrior):
+                    raise ValueError("PMMCMC method GHQ only works for normal priors on the time shifts!")
+                mu = self.shift_prior.mu[self.signal_mask]
+                sigma = self.shift_prior.sigma[self.signal_mask]
+                pts, wts = numpy.polynomial.hermite.hermgauss(num_pts_PMMCMC)
+                self.dt_quad_arr = scipy.sqrt(2.0) * sigma * pts[:, None] + mu
+                self.ln_dt_quad_wts = scipy.log(1.0 / (scipy.sqrt(2.0 * scipy.pi) * sigma) * wts[:, None])
+            else:
+                raise ValueError("Unknown method for PMMCMC marginalization!")
     
     @property
     def num_params(self):
@@ -1774,34 +1801,38 @@ class Run(object):
             [(self.V_lb_outer, self.V_ub_outer)]
         )
         # Knots:
-        if self.sort_knots:
-            prior = prior * gptools.UniformJointPrior(
-                [(self.roa_grid_DV.min(), self.roa_grid_DV.max())] * (nkD + nkV)
-            )
-        else:
-            prior = prior * (
-                gptools.SortedUniformJointPrior(
-                    nkD,
-                    self.roa_grid_DV.min(),
-                    self.roa_grid_DV.max()
-                ) *
-                gptools.SortedUniformJointPrior(
-                    nkV,
-                    self.roa_grid_DV.min(),
-                    self.roa_grid_DV.max()
+        if nkD + nkV > 0:
+            if self.sort_knots:
+                prior = prior * gptools.UniformJointPrior(
+                    [(self.roa_grid_DV.min(), self.roa_grid_DV.max())] * (nkD + nkV)
                 )
-            )
-        # Scaling:
-        prior = prior * gptools.GammaJointPriorAlt([1.0,] * nS, [0.1,] * nS)
+            else:
+                prior = prior * (
+                    gptools.SortedUniformJointPrior(
+                        nkD,
+                        self.roa_grid_DV.min(),
+                        self.roa_grid_DV.max()
+                    ) *
+                    gptools.SortedUniformJointPrior(
+                        nkV,
+                        self.roa_grid_DV.min(),
+                        self.roa_grid_DV.max()
+                    )
+                )
         
-        # Shifts:
-        prior = prior * self.shift_prior
+        if nS > 0:
+            # Scaling:
+            prior = prior * gptools.GammaJointPriorAlt([1.0,] * nS, [0.1,] * nS)
+            
+            # Shifts:
+            prior = prior * self.shift_prior
         
         # ne, Te:
-        prior = prior * gptools.NormalJointPrior(
-            [0.0,] * (self.num_eig_ne + self.num_eig_Te),
-            [1.0,] * (self.num_eig_ne + self.num_eig_Te)
-        )
+        if self.num_eig_ne + self.num_eig_Te > 0:
+            prior = prior * gptools.NormalJointPrior(
+                [0.0,] * (self.num_eig_ne + self.num_eig_Te),
+                [1.0,] * (self.num_eig_ne + self.num_eig_Te)
+            )
         
         return prior
     
@@ -2401,6 +2432,7 @@ class Run(object):
                 )
                 for i in range(0, s.y.shape[1])
             ]
+            if s is not None else None
             for j, s in enumerate(self.signals)
         ]
     
@@ -2453,42 +2485,103 @@ class Run(object):
         # Mask for where the active time shifts are:
         mask = scipy.arange(nD + nV + nkD + nkV + nS, nD + nV + nkD + nkV + nS + nDiag)[self.signal_mask]
         
-        # The QMC points are stored as an (NPTS, NDIM) array:
-        ln_prob = scipy.zeros(self.dt_quad_arr.shape[0])
-        if debug_plots:
-            ln_fz = scipy.zeros(self.dt_quad_arr.shape[0])
-        for i in range(0, self.dt_quad_arr.shape[0]):
-            self.params[mask] = self.dt_quad_arr[i]
-            ln_prob[i] = self.dlines2ln_prob(
-                dlines,
-                time,
-                debug_plots=debug_plots > 1,
-                no_prior=True,
-                sigsplines=sigsplines,
-                **kwargs
-            )
+        if self.method_PMMCMC == 'QMC':
+            # The QMC points are stored as an (NPTS, NDIM) array:
+            ln_prob = scipy.zeros(self.dt_quad_arr.shape[0])
             if debug_plots:
-                ln_fz[i] = self.shift_prior(self.params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag])
+                ln_fz = scipy.zeros(self.dt_quad_arr.shape[0])
+            for i in range(0, self.dt_quad_arr.shape[0]):
+                self.params[mask] = self.dt_quad_arr[i]
+                ln_prob[i] = self.dlines2ln_prob(
+                    dlines,
+                    time,
+                    debug_plots=debug_plots > 1,
+                    no_prior=True,
+                    sigsplines=sigsplines,
+                    **kwargs
+                )
+                if debug_plots:
+                    ln_fz[i] = self.shift_prior(self.params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag])
+            
+            # Apply the log-sum-exp trick:
+            A = ln_prob.max()
+            lp = scipy.log(scipy.exp(ln_prob - A).sum()) + A - scipy.log(len(ln_prob))
+            if debug_plots:
+                if len(mask) == 1:
+                    f = plt.figure()
+                    a = f.add_subplot(1, 1, 1)
+                    a.plot(self.dt_quad_arr[:, 0], ln_prob + ln_fz, 'o')
+                elif len(mask) == 2:
+                    # Interpolate to regular grid:
+                    dt0 = scipy.linspace(self.dt_quad_arr[:, 0].min(), self.dt_quad_arr[:, 0].max(), 100)
+                    dt1 = scipy.linspace(self.dt_quad_arr[:, 1].min(), self.dt_quad_arr[:, 1].max(), 101)
+                    ln_fz_interp = scipy.interpolate.griddata(self.dt_quad_arr, ln_prob + ln_fz, (dt0[None, :], dt1[:, None]))
+                    f = plt.figure()
+                    a = f.add_subplot(1, 1, 1)
+                    a.contourf(dt0, dt1, ln_fz_interp, 25)
+        elif self.method_PMMCMC == 'GHQ':
+            diffs = []
+            for i in range(0, self.dt_quad_arr.shape[0]):
+                self.params[mask] = self.dt_quad_arr[i]
+                diffs.append(
+                    self.dlines2diffs(
+                        dlines,
+                        time,
+                        debug_plots=debug_plots > 1,
+                        sigsplines=sigsplines
+                    )
+                )
+            # Each entry in diffs will now be a list of arrays containing the
+            # differences for each signal. Now we need to form the ln_prob...
+            ll_wt = scipy.zeros_like(self.dt_quad_arr)
+            signals_masked = [s for s in self.signals if s is not None]
+            # TODO: This can probably be vectorized!
+            for i, d in enumerate(diffs):
+                for j, (sd, ss) in enumerate(zip(d, signals_masked)):
+                    dnorm2 = (sd / (ss.std_y_norm if self.normalize else ss.std_y))**2.0
+                    ll_wt[i, j] = -0.5 * dnorm2[~scipy.isnan(dnorm2)].sum() + self.ln_dt_quad_wts[i, j]
+            lp = 0.0
+            for ll in ll_wt.T:
+                A = ll.max()
+                lp += scipy.log(scipy.exp(ll - A).sum()) + A
+            if debug_plots:
+                if len(mask) == 1:
+                    # Compute the prior on time scales:
+                    dts = scipy.zeros(len(self.signals))
+                    ln_fz = scipy.zeros(self.dt_quad_arr.shape[0])
+                    for i, dt in enumerate(self.dt_quad_arr[:, 0]):
+                        dts[self.signal_mask] = dt
+                        ln_fz[i] = self.shift_prior(dts)
+                    f = plt.figure()
+                    a = f.add_subplot(1, 1, 1)
+                    a.plot(self.dt_quad_arr[:, 0], ll_wt[:, 0] + ln_fz)
+                elif len(mask) == 2:
+                    # Compute the prior on time scales:
+                    DT0, DT1 = scipy.meshgrid(self.dt_quad_arr[:, 0], self.dt_quad_arr[:, 1])
+                    dt0 = DT0.ravel()
+                    dt1 = DT1.ravel()
+                    ln_fz = scipy.zeros(len(dt1))
+                    dts = scipy.zeros(len(self.signals))
+                    for i, (dt0v, dt1v) in enumerate(zip(dt0, dt1)):
+                        dts[self.signal_mask] = [dt0v, dt1v]
+                        ln_fz[i] = self.shift_prior(dts)
+                    ln_fz = scipy.reshape(ln_fz, DT0.shape)
+                    f = plt.figure()
+                    a = f.add_subplot(1, 1, 1)
+                    a.contourf(
+                        self.dt_quad_arr[:, 0],
+                        self.dt_quad_arr[:, 1],
+                        ll_wt[:, 0][:, None] + ll_wt[:, 0][None, :] + ln_fz,
+                        25
+                    )
+        else:
+            raise ValueError("Unknown method for PMMCMC!")
         
-        # Apply the log-sum-exp trick:
-        A = ln_prob.max()
-        lp = scipy.log(scipy.exp(ln_prob - A).sum()) + A - scipy.log(len(ln_prob))
         if not no_prior:
-            lp += self.get_prior()(self.params) - self.shift_prior(self.params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag])
-        
-        if debug_plots:
-            if len(mask) == 1:
-                f = plt.figure()
-                a = f.add_subplot(1, 1, 1)
-                a.plot(self.dt_quad_arr[:, 0], ln_prob + ln_fz, 'o')
-            elif len(mask) == 2:
-                # Interpolate to regular grid:
-                dt0 = scipy.linspace(self.dt_quad_arr[:, 0].min(), self.dt_quad_arr[:, 0].max(), 100)
-                dt1 = scipy.linspace(self.dt_quad_arr[:, 1].min(), self.dt_quad_arr[:, 1].max(), 101)
-                ln_fz_interp = scipy.interpolate.griddata(self.dt_quad_arr, ln_prob + ln_fz, (dt0[None, :], dt1[:, None]))
-                f = plt.figure()
-                a = f.add_subplot(1, 1, 1)
-                a.contourf(dt0, dt1, ln_fz_interp, 25)
+            lp += (
+                self.get_prior()(self.params) -
+                self.shift_prior(self.params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag])
+            )
         
         return lp
     
@@ -2594,6 +2687,7 @@ class Run(object):
             params=None,
             steady_ar=None,
             debug_plots=False,
+            sigsplines=None
         ):
         """Computes the diagnostic differences corresponding to the given local emissivities.
         
@@ -2606,6 +2700,7 @@ class Run(object):
             params=params,
             steady_ar=steady_ar,
             debug_plots=debug_plots,
+            sigsplines=sigsplines
         )
         return self.sig2diffs(sig, steady_ar=steady_ar)
     
@@ -3030,7 +3125,7 @@ class Run(object):
                     debug_plots=debug_plots
                 )
                 local_diffs = self.local_sig2local_diffs(local_sig)
-                return self.local_diffs2ln_prob(local_diffs, sign=sign)
+                return self.local_diffs2ln_prob(local_diffs, sign=sign, no_prior=no_prior)
             else:
                 dlines = self.cs_den2dlines(
                     cs_den,
@@ -3136,9 +3231,11 @@ class Run(object):
         elif (u > 1.0).any():
             print("Upper bound fail!")
             u[u > 1.0] = 1.0
-        params = self.get_prior().sample_u(u)
+        u_full = 0.5 * scipy.ones_like(self.params, dtype=float)
+        u_full[~self.fixed_params] = u
+        params = self.get_prior().sample_u(u_full)[~self.fixed_params]
         try:
-            fu = self.DV2ln_prob(params, sign=sign, **kwargs)
+            fu = self.DV2ln_prob(params=params, sign=sign, **kwargs)
         except:
             print(u)
             fu = sign * -scipy.inf
@@ -3190,6 +3287,187 @@ class Run(object):
         if return_grad:
             print(time_.time() - start)
         return out
+    
+    def u2ln_prob_local(self, *args, **kwargs):
+        kwargs['use_local'] = True
+        return self.u2ln_prob(*args, **kwargs)
+    
+    def DV2d_ln_prob(self, grad_idx, stepsize=1e-4, params=None, **kwargs):
+        """Compute the derivative of the log-posterior with respect to one parameter.
+        
+        By default, centered differences are used. If a parameter is too close
+        to one of the bounds for the given stepsize, forward or backward
+        differences will be used, as appropriate.
+        
+        Parameters
+        ----------
+        grad_idx : int
+            The index of the parameter to take the derivative with respect to.
+            This refers to the index in the full parameter set, not just the
+            free parameters.
+        stepsize : float, optional
+            The step size to use with finite differences. Default is square root
+            of machine epsilon.
+        params : array of float, (`num_param`,) or (`num_free_params`,), optional
+            The point to take the derivative at. Default is to use
+            :py:attr:`self.params`.
+        **kwargs : optional keywords
+            All additional keywords are passed to :py:meth:`DV2ln_prob`.
+        """
+        if params is not None:
+            params = scipy.asarray(params, dtype=float)
+            if len(params) == self.num_params:
+                self.params = params
+            else:
+                self.free_params = params
+        # Always work with the full version:
+        params = self.params.copy()
+        
+        bounds = scipy.asarray(self.get_prior().bounds[:], dtype=float)
+        
+        if params[grad_idx] - stepsize >= bounds[grad_idx, 0] and params[grad_idx] + stepsize <= bounds[grad_idx, 1]:
+            params_plus_1 = params.copy()
+            params_plus_1[grad_idx] += stepsize
+            f_plus_1 = self.DV2ln_prob(params=params_plus_1, **kwargs)
+            
+            # params_plus_2 = params.copy()
+            # params_plus_2[grad_idx] += stepsize * 2.0
+            # f_plus_2 = self.DV2ln_prob(params=params_plus_2, **kwargs)
+            #
+            # params_plus_3 = params.copy()
+            # params_plus_3[grad_idx] += stepsize * 3.0
+            # f_plus_3 = self.DV2ln_prob(params=params_plus_3, **kwargs)
+            
+            params_minus_1 = params.copy()
+            params_minus_1[grad_idx] -= stepsize
+            f_minus_1 = self.DV2ln_prob(params=params_minus_1, **kwargs)
+            
+            # params_minus_2 = params.copy()
+            # params_minus_2[grad_idx] -= stepsize * 2.0
+            # f_minus_2 = self.DV2ln_prob(params=params_minus_2, **kwargs)
+            #
+            # params_minus_3 = params.copy()
+            # params_minus_3[grad_idx] -= stepsize * 3.0
+            # f_minus_3 = self.DV2ln_prob(params=params_minus_3, **kwargs)
+            
+            # Use centered difference (h^2 accuracy):
+            return (f_plus_1 - f_minus_1) / (2.0 * stepsize)
+            
+            # Use centered difference (h^4 accuracy):
+            # d4 = (f_minus_2 - 8 * f_minus_1 + 8 * f_plus_1 - f_plus_2) / (12.0 * stepsize)
+            
+            # Use centered difference (h^6 accuracy):
+            # d6 = (-f_minus_3 + 9 * f_minus_2 - 45 * f_minus_1 + 45 * f_plus_1 - 9 * f_plus_2 + f_plus_3) / (60.0 * stepsize)
+        elif params[grad_idx] + stepsize <= bounds[grad_idx, 1]:
+            # Use forward difference (h^1 accuracy):
+            f = self.DV2ln_prob(params=params.copy(), **kwargs)
+            
+            params_plus = params.copy()
+            params_plus[grad_idx] += stepsize
+            f_plus = self.DV2ln_prob(params=params_plus, **kwargs)
+            
+            return (f_plus - f) / stepsize
+        elif params[grad_idx] - stepsize >= bounds[grad_idx, 0]:
+            # Use backward difference (h^1 accuracy):
+            f = self.DV2ln_prob(params=params.copy(), **kwargs)
+            
+            params_minus = params.copy()
+            params_minus[grad_idx] -= stepsize
+            f_minus = self.DV2ln_prob(params=params_minus, **kwargs)
+            
+            return (f - f_minus) / stepsize
+        else:
+            raise ValueError("Stepsize is too large, could not use any finite difference equation!")
+    
+    def DV2d2_ln_prob(self, grad_idx_1, grad_idx_2, stepsize=1e-4, params=None, **kwargs):
+        r"""Compute the second derivative of the log-posterior with respect to two parameters.
+        
+        By default, centered differences are used. If a parameter is too close
+        to one of the bounds for the given stepsize, forward or backward
+        differences will be used, as appropriate.
+        
+        The derivatives are related to the indices by
+        
+        .. math::
+            
+            \frac{d}{d \theta_1}\left ( \frac{d}{\theta_2}(\ln p) \right )
+        
+        Parameters
+        ----------
+        grad_idx_1 : int
+            The index of the parameter to take the "outer" derivative with
+            respect to.
+        grad_idx_2 : int
+            The index of the parameter to take the "inner" derivative with
+            respect to.
+        stepsize : float, optional
+            The step size to use with finite differences. The same stepsize is
+            used for each dimension. Default is square root of machine epsilon.
+        params : array of float, (`num_param`,) or (`num_free_params`,), optional
+            The point to take the derivative at. Default is to use
+            :py:attr:`self.params`.
+        **kwargs : optional keywords
+            All additional keywords are passed to :py:meth:`DV2d_ln_prob`.
+        """
+        if params is not None:
+            params = scipy.asarray(params, dtype=float)
+            if len(params) == self.num_params:
+                self.params = params
+            else:
+                self.free_params = params
+        # Always work with the full version:
+        params = self.params.copy()
+        
+        bounds = scipy.asarray(self.get_prior().bounds[:], dtype=float)
+        
+        if params[grad_idx_1] - stepsize >= bounds[grad_idx_1, 0] and params[grad_idx_1] + stepsize <= bounds[grad_idx_1, 1]:
+            # Use centered difference:
+            params_plus = params.copy()
+            params_plus[grad_idx_1] += stepsize
+            f_plus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params_plus, **kwargs)
+            
+            params_minus = params.copy()
+            params_minus[grad_idx_1] -= stepsize
+            f_minus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params_minus, **kwargs)
+            
+            return (f_plus - f_minus) / (2.0 * stepsize)
+        elif params[grad_idx_1] + stepsize <= bounds[grad_idx_1, 1]:
+            # Use forward difference:
+            f = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params.copy(), **kwargs)
+            
+            params_plus = params.copy()
+            params_plus[grad_idx_1] += stepsize
+            f_plus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params_plus, **kwargs)
+            
+            return (f_plus - f) / stepsize
+        elif params[grad_idx_1] - stepsize >= bounds[grad_idx_1, 0]:
+            # Use backward difference:
+            f = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params.copy(), **kwargs)
+            
+            params_minus = params.copy()
+            params_minus[grad_idx_1] -= stepsize
+            f_minus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params_minus, **kwargs)
+            
+            return (f - f_minus) / stepsize
+        else:
+            raise ValueError("Stepsize is too large, could not use any finite difference equation!")
+    
+    def DV2hessian(self, **kwargs):
+        """Compute the Hessian matrix for the free parameters.
+        
+        All keywords (including `params`) are passed to :py:meth:`DV2d2_ln_prob`.
+        """
+        H = scipy.zeros((self.num_free_params, self.num_free_params))
+        for i in range(0, self.num_free_params):
+            for j in range(i, self.num_free_params):
+                val = self.DV2d2_ln_prob(
+                    self.free_param_idxs[i],
+                    self.free_param_idxs[j],
+                    **kwargs
+                )
+                H[i, j] = val
+                H[j, i] = val
+        return H
     
     # Routines for multinest:
     def multinest_prior(self, cube, ndim, nparams):
@@ -3641,7 +3919,7 @@ class Run(object):
             callback=on_click, logscale=True
         )
     
-    def find_MAP_estimate(self, random_starts=None, num_proc=None, pool=None, theta0=None, thresh=None):
+    def find_MAP_estimate(self, random_starts=None, num_proc=None, pool=None, theta0=None, thresh=None, use_local=False):
         """Find the most likely parameters given the data.
         
         Parameters
@@ -3671,22 +3949,23 @@ class Run(object):
             random_starts = 2 * num_proc
         prior = self.get_prior()
         if theta0 is None:
-            param_samples = prior.random_draw(size=random_starts).T
+            param_samples = prior.random_draw(size=random_starts)[~self.fixed_params, :].T
         else:
             param_samples = scipy.atleast_2d(theta0)
         t_start = time_.time()
         if pool is not None:
             res = pool.map(
-                _OptimizeEval(self, thresh=thresh),
+                _OptimizeEval(self, thresh=thresh, use_local=use_local),
                 param_samples
             )
         else:
             res = map(
-                _OptimizeEval(self, thresh=thresh),
+                _OptimizeEval(self, thresh=thresh, use_local=use_local),
                 param_samples
             )
         t_elapsed = time_.time() - t_start
         print("All done, wrapping up!")
+        res_min = max(res, key=lambda r: r[1])
         # res = [r for r in res if r is not None]
         # TODO: Implement this for the new fmin_l_bfgs_b-based version...
         # if res:
@@ -3707,8 +3986,40 @@ class Run(object):
         
         print("MAP estimate complete. Elapsed time is %.2fs. Got %d completed." % (t_elapsed, len(res)))
         
-        # return (res_min, res)
-        return res
+        # Compute the Hessian at the best result:
+        print("Estimating Hessian matrix...")
+        H = self.DV2hessian(params=res_min[0])
+        # nd.Hessian does not respect bounds!
+        # H = nd.Hessian(lambda p: self.DV2ln_prob(params=p, use_local=use_local))(res_min[0])
+        cov_min = scipy.linalg.inv(-H)
+        
+        # Estimate the AIC and BIC at the best result:
+        # (This is technically a kludge, because they are supposed to be at the
+        # MLE, but what I find is the MAP.)
+        print("Estimating AIC, BIC...")
+        ll_hat = self.DV2ln_prob(params=res_min[0], use_local=use_local, no_prior=True)
+        num_params = (~self.fixed_params).sum()
+        num_data = 0
+        if use_local:
+            ss = self.local_signals
+        else:
+            ss = self.signals
+        for s in ss:
+            if s is not None:
+                num_data += (~scipy.isnan(s.y)).sum()
+        AIC = 2.0 * (num_params - ll_hat)
+        BIC = -2.0 * ll_hat + num_params * scipy.log(num_data)
+        
+        out = {
+            'all_results': res,
+            'best_result': res_min,
+            'best_covariance': cov_min,
+            'best_AIC': AIC,
+            'best_BIC': BIC
+        }
+        
+        return out
+        # return res
     
     def MAP_from_SQL(self):
         """Get a job to do from the SQL server.
@@ -7707,17 +8018,18 @@ class _OptimizeEval(object):
     thresh : float, optional
         If True, a test run of the starting 
     """
-    def __init__(self, run, thresh=None):
+    def __init__(self, run, thresh=None, use_local=False):
         self.run = run
         # Get the bounds into the correct format for scipy.optimize.minimize:
-        b = self.run.get_prior().bounds[:]
-        self.bounds = [list(v) for v in b]
-        for v in self.bounds:
-            if scipy.isinf(v[0]):
-                v[0] = None
-            if scipy.isinf(v[1]):
-                v[1] = None
+        # b = self.run.get_prior().bounds[:]
+        # self.bounds = [list(v) for v in b]
+        # for v in self.bounds:
+        #     if scipy.isinf(v[0]):
+        #         v[0] = None
+        #     if scipy.isinf(v[1]):
+        #         v[1] = None
         self.thresh = thresh
+        self.use_local = use_local
     
     def __call__(self, params):
         """Run the optimizer starting at the given params.
@@ -7731,7 +8043,7 @@ class _OptimizeEval(object):
         
         try:
             if self.thresh is not None:
-                l = self.run.DV2ln_prob(params, sign=-1)
+                l = self.run.DV2ln_prob(params, sign=-1, use_local=self.use_local)
                 if scipy.isinf(l) or scipy.isnan(l) or l > self.thresh:
                     warnings.warn("Bad start, skipping! lp=%.3g" % (l,))
                     return None
@@ -7762,14 +8074,21 @@ class _OptimizeEval(object):
             #     maxfun=50000
             # )
             opt = nlopt.opt(nlopt.LN_SBPLX, len(params))
-            opt.set_max_objective(self.run.u2ln_prob)
+            opt.set_max_objective(self.run.u2ln_prob_local if self.use_local else self.run.u2ln_prob)
             opt.set_lower_bounds([0.0,] * opt.get_dimension())
             opt.set_upper_bounds([1.0,] * opt.get_dimension())
-            opt.set_ftol_abs(1.0)
+            # opt.set_ftol_abs(1.0)
+            opt.set_ftol_rel(1e-8)
             # opt.set_maxeval(40000)#(100000)
             opt.set_maxtime(3600 * 12)
-            uopt = opt.optimize(self.run.get_prior().elementwise_cdf(params))
-            out = (uopt, opt.last_optimum_value(), opt.last_optimize_result(), NUM_STRAHL_CALLS)
+            p0 = self.run.params.copy()
+            p0[~self.run.fixed_params] = params
+            uopt = opt.optimize(self.run.get_prior().elementwise_cdf(p0)[~self.run.fixed_params])
+            # Convert uopt back to params:
+            u_full = 0.5 * scipy.ones_like(self.run.params, dtype=float)
+            u_full[~self.run.fixed_params] = uopt
+            p_opt = self.run.get_prior().sample_u(u_full)[~self.run.fixed_params]
+            out = (p_opt, opt.last_optimum_value(), opt.last_optimize_result(), NUM_STRAHL_CALLS)
             print("Done. Made %d calls to STRAHL." % (NUM_STRAHL_CALLS,))
             return out
         except:
