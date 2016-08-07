@@ -68,6 +68,7 @@ from connect import get_connection, send_email
 import fcntl
 import sobol
 import numdifftools as nd
+from sklearn.preprocessing import PolynomialFeatures
 
 # Store the PID of the main thread:
 MAIN_PID = os.getpid()
@@ -876,20 +877,6 @@ class Run(object):
                 # Read it back in to ensure consistency:
                 self.atomdat = read_atomdat('Ca.atomdat')
                 
-                # Get the base cs_den truth data:
-                # The prior won't work until the signals are created, so this
-                # must be done here.
-                self.params = self.params_true.copy()
-                self.fixed_params = scipy.zeros_like(self.params, dtype=bool)
-                cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(
-                    self.params_true,
-                    debug_plots=debug_plots,
-                    explicit_D=self.explicit_D,
-                    explicit_D_grid=self.explicit_D_grid,
-                    explicit_V=self.explicit_V,
-                    explicit_V_grid=self.explicit_V_grid
-                )
-                
                 if use_local:
                     # Local:
                     npts = int(scipy.ceil((self.time_2 - self.time_1 + presampling_time) / local_time_res))
@@ -991,6 +978,19 @@ class Run(object):
                     self.fixed_params = scipy.zeros_like(self.params, dtype=bool)
                     self.compute_view_data()
                     
+                    # Get the base cs_den truth data:
+                    # The prior won't work until the signals are created, so
+                    # this must be done here.
+                    self.params = self.params_true.copy()
+                    self.fixed_params = scipy.zeros_like(self.params, dtype=bool)
+                    cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(
+                        debug_plots=debug_plots,
+                        explicit_D=self.explicit_D,
+                        explicit_D_grid=self.explicit_D_grid,
+                        explicit_V=self.explicit_V,
+                        explicit_V_grid=self.explicit_V_grid
+                    )
+                    
                     # Temporarily override normalization so we can get the
                     # absolute and relative signals:
                     # First, absolute:
@@ -1006,7 +1006,7 @@ class Run(object):
                     
                     # Now for Ar:
                     cs_den_ar, sqrtpsinorm, time_ar, ne, Te = self.DV2cs_den(
-                        self.params_true,
+                        params=self.params_true,
                         debug_plots=debug_plots,
                         steady_ar=1e15,
                         explicit_D=self.explicit_D,
@@ -1054,6 +1054,19 @@ class Run(object):
                         explicit_V_grid=self.explicit_V_grid
                     )
                 else:
+                    # Get the base cs_den truth data:
+                    # The prior won't work until the signals are created, so
+                    # this must be done here.
+                    self.params = self.params_true.copy()
+                    self.fixed_params = scipy.zeros_like(self.params, dtype=bool)
+                    cs_den, sqrtpsinorm, time, ne, Te = self.DV2cs_den(
+                        debug_plots=debug_plots,
+                        explicit_D=self.explicit_D,
+                        explicit_D_grid=self.explicit_D_grid,
+                        explicit_V=self.explicit_V,
+                        explicit_V_grid=self.explicit_V_grid
+                    )
+                    
                     self.ar_signal=None
                     self.truth_data = TruthData(
                         params_true,
@@ -1185,7 +1198,7 @@ class Run(object):
         free_param_bounds : :py:class:`Array`
             Array of the bounds of the free parameters, in order.
         """
-        return gptools.MaskedBounds(self.get_prior().bounds, self.free_param_idxs)
+        return scipy.asarray(self.get_prior().bounds[:], dtype=float)[self.free_param_idxs, :]
     
     @free_param_bounds.setter
     def free_param_bounds(self, value):
@@ -1518,7 +1531,7 @@ class Run(object):
                 cs_den_norm = self.truth_data.cs_den[:, sls.cs_den_idx, :]
             
             if noise_type == 'proportional Gaussian':
-                sls.y[:, :] = spl(sls.t, sls.sqrtpsinorm)
+                sls.y = spl(sls.t, sls.sqrtpsinorm)
                 sls.std_y = n * sls.y
                 sls.y *= (1.0 + n * scipy.randn(*sls.y.shape))
                 sls.y[sls.y < 0.0] = 0.0
@@ -1527,7 +1540,7 @@ class Run(object):
                 # Just normalize to the innermost chord:
                 cs_den_norm = cs_den_norm / cs_den_norm[:, 0].max()
                 spl = scipy.interpolate.RectBivariateSpline(self.truth_data.time - self.time_1, self.truth_data.sqrtpsinorm, cs_den_norm)
-                sls.y_norm[:, :] = spl(sls.t, sls.sqrtpsinorm)
+                sls.y_norm = spl(sls.t, sls.sqrtpsinorm)
                 sls.std_y_norm = n * sls.y_norm
                 sls.y_norm *= (1.0 + n * scipy.randn(*sls.y_norm.shape))
                 sls.y_norm[sls.y_norm < 0.0] = 0.0
@@ -2294,6 +2307,12 @@ class Run(object):
                         srt = s.t.argsort()
                         for k, ax in enumerate(a):
                             ax.plot(s.t[srt], sig[i][srt, k], '.-')
+                            if hasattr(self, 'truth_data') and self.truth_data is not None:
+                                ax.plot(
+                                    s.t,
+                                    self.truth_data.sig_norm[i][:, k] if self.normalize else self.truth_data.sig_abs[i][:, k],
+                                    '.--'
+                                )
             else:
                 # This is just a function of chord number. The time-variation
                 # won't tell me much, but the profile will.
@@ -3292,7 +3311,11 @@ class Run(object):
         kwargs['use_local'] = True
         return self.u2ln_prob(*args, **kwargs)
     
-    def DV2d_ln_prob(self, grad_idx, stepsize=1e-4, params=None, **kwargs):
+    def DV2jac(self, params=None, sign=1.0, **kwargs):
+        return nd.Gradient(self.DV2ln_prob)(params) * sign
+        # return scipy.asarray([self.DV2d_ln_prob(i, params=params, sign=sign, **kwargs) for i in self.free_param_idxs], dtype=float)
+    
+    def DV2d_ln_prob(self, grad_idx, stepsize=None, params=None, **kwargs):
         """Compute the derivative of the log-posterior with respect to one parameter.
         
         By default, centered differences are used. If a parameter is too close
@@ -3325,39 +3348,49 @@ class Run(object):
         
         bounds = scipy.asarray(self.get_prior().bounds[:], dtype=float)
         
+        if stepsize is None:
+            # Round to a exactly representable step:
+            if scipy.absolute(params[grad_idx]) >= 1e-4:
+                temp = params[grad_idx] * (1.0 + (sys.float_info.epsilon)**(1.0 / 3.0))
+            else:
+                temp = params[grad_idx] + (sys.float_info.epsilon)**(1.0 / 3.0) * 1e-4
+            stepsize = temp - params[grad_idx]
+        
         if params[grad_idx] - stepsize >= bounds[grad_idx, 0] and params[grad_idx] + stepsize <= bounds[grad_idx, 1]:
             params_plus_1 = params.copy()
             params_plus_1[grad_idx] += stepsize
             f_plus_1 = self.DV2ln_prob(params=params_plus_1, **kwargs)
             
-            # params_plus_2 = params.copy()
-            # params_plus_2[grad_idx] += stepsize * 2.0
-            # f_plus_2 = self.DV2ln_prob(params=params_plus_2, **kwargs)
-            #
-            # params_plus_3 = params.copy()
-            # params_plus_3[grad_idx] += stepsize * 3.0
-            # f_plus_3 = self.DV2ln_prob(params=params_plus_3, **kwargs)
+            params_plus_2 = params.copy()
+            params_plus_2[grad_idx] += stepsize * 2.0
+            f_plus_2 = self.DV2ln_prob(params=params_plus_2, **kwargs)
+            
+            params_plus_3 = params.copy()
+            params_plus_3[grad_idx] += stepsize * 3.0
+            f_plus_3 = self.DV2ln_prob(params=params_plus_3, **kwargs)
             
             params_minus_1 = params.copy()
             params_minus_1[grad_idx] -= stepsize
             f_minus_1 = self.DV2ln_prob(params=params_minus_1, **kwargs)
             
-            # params_minus_2 = params.copy()
-            # params_minus_2[grad_idx] -= stepsize * 2.0
-            # f_minus_2 = self.DV2ln_prob(params=params_minus_2, **kwargs)
-            #
-            # params_minus_3 = params.copy()
-            # params_minus_3[grad_idx] -= stepsize * 3.0
-            # f_minus_3 = self.DV2ln_prob(params=params_minus_3, **kwargs)
+            params_minus_2 = params.copy()
+            params_minus_2[grad_idx] -= stepsize * 2.0
+            f_minus_2 = self.DV2ln_prob(params=params_minus_2, **kwargs)
+            
+            params_minus_3 = params.copy()
+            params_minus_3[grad_idx] -= stepsize * 3.0
+            f_minus_3 = self.DV2ln_prob(params=params_minus_3, **kwargs)
             
             # Use centered difference (h^2 accuracy):
-            return (f_plus_1 - f_minus_1) / (2.0 * stepsize)
+            # d2 = (f_plus_1 - f_minus_1) / (2.0 * stepsize)
             
             # Use centered difference (h^4 accuracy):
             # d4 = (f_minus_2 - 8 * f_minus_1 + 8 * f_plus_1 - f_plus_2) / (12.0 * stepsize)
             
             # Use centered difference (h^6 accuracy):
-            # d6 = (-f_minus_3 + 9 * f_minus_2 - 45 * f_minus_1 + 45 * f_plus_1 - 9 * f_plus_2 + f_plus_3) / (60.0 * stepsize)
+            d6 = (-f_minus_3 + 9 * f_minus_2 - 45 * f_minus_1 + 45 * f_plus_1 - 9 * f_plus_2 + f_plus_3) / (60.0 * stepsize)
+            
+            return d6 #d2, d4, d6
         elif params[grad_idx] + stepsize <= bounds[grad_idx, 1]:
             # Use forward difference (h^1 accuracy):
             f = self.DV2ln_prob(params=params.copy(), **kwargs)
@@ -3379,7 +3412,7 @@ class Run(object):
         else:
             raise ValueError("Stepsize is too large, could not use any finite difference equation!")
     
-    def DV2d2_ln_prob(self, grad_idx_1, grad_idx_2, stepsize=1e-4, params=None, **kwargs):
+    def DV2d2_ln_prob(self, grad_idx_1, grad_idx_2, stepsize=[None, None], params=None, **kwargs):
         r"""Compute the second derivative of the log-posterior with respect to two parameters.
         
         By default, centered differences are used. If a parameter is too close
@@ -3400,7 +3433,7 @@ class Run(object):
         grad_idx_2 : int
             The index of the parameter to take the "inner" derivative with
             respect to.
-        stepsize : float, optional
+        stepsize : list of float, optional
             The step size to use with finite differences. The same stepsize is
             used for each dimension. Default is square root of machine epsilon.
         params : array of float, (`num_param`,) or (`num_free_params`,), optional
@@ -3420,35 +3453,43 @@ class Run(object):
         
         bounds = scipy.asarray(self.get_prior().bounds[:], dtype=float)
         
-        if params[grad_idx_1] - stepsize >= bounds[grad_idx_1, 0] and params[grad_idx_1] + stepsize <= bounds[grad_idx_1, 1]:
+        if stepsize[0] is None:
+            # Round to a exactly representable step:
+            if scipy.absolute(params[grad_idx_1]) >= 1e-4:
+                temp = params[grad_idx_1] * (1.0 + (sys.float_info.epsilon)**(1.0 / 3.0))
+            else:
+                temp = params[grad_idx_1] + (sys.float_info.epsilon)**(1.0 / 3.0) * 1e-4
+            stepsize[0] = temp - params[grad_idx_1]
+        
+        if params[grad_idx_1] - stepsize[0] >= bounds[grad_idx_1, 0] and params[grad_idx_1] + stepsize[0] <= bounds[grad_idx_1, 1]:
             # Use centered difference:
             params_plus = params.copy()
-            params_plus[grad_idx_1] += stepsize
-            f_plus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params_plus, **kwargs)
+            params_plus[grad_idx_1] += stepsize[0]
+            f_plus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize[1], params=params_plus, **kwargs)
             
             params_minus = params.copy()
-            params_minus[grad_idx_1] -= stepsize
-            f_minus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params_minus, **kwargs)
+            params_minus[grad_idx_1] -= stepsize[0]
+            f_minus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize[1], params=params_minus, **kwargs)
             
-            return (f_plus - f_minus) / (2.0 * stepsize)
-        elif params[grad_idx_1] + stepsize <= bounds[grad_idx_1, 1]:
+            return (f_plus - f_minus) / (2.0 * stepsize[0])
+        elif params[grad_idx_1] + stepsize[0] <= bounds[grad_idx_1, 1]:
             # Use forward difference:
-            f = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params.copy(), **kwargs)
+            f = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize[1], params=params.copy(), **kwargs)
             
             params_plus = params.copy()
-            params_plus[grad_idx_1] += stepsize
-            f_plus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params_plus, **kwargs)
+            params_plus[grad_idx_1] += stepsize[0]
+            f_plus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize[1], params=params_plus, **kwargs)
             
-            return (f_plus - f) / stepsize
-        elif params[grad_idx_1] - stepsize >= bounds[grad_idx_1, 0]:
+            return (f_plus - f) / stepsize[0]
+        elif params[grad_idx_1] - stepsize[0] >= bounds[grad_idx_1, 0]:
             # Use backward difference:
-            f = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params.copy(), **kwargs)
+            f = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize[1], params=params.copy(), **kwargs)
             
             params_minus = params.copy()
-            params_minus[grad_idx_1] -= stepsize
-            f_minus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize, params=params_minus, **kwargs)
+            params_minus[grad_idx_1] -= stepsize[0]
+            f_minus = self.DV2d_ln_prob(grad_idx_2, stepsize=stepsize[1], params=params_minus, **kwargs)
             
-            return (f - f_minus) / stepsize
+            return (f - f_minus) / stepsize[0]
         else:
             raise ValueError("Stepsize is too large, could not use any finite difference equation!")
     
@@ -3468,6 +3509,86 @@ class Run(object):
                 H[i, j] = val
                 H[j, i] = val
         return H
+    
+    def DV2hessian_2(self, params, stepsize=None, numsteps=2, pool=None):
+        """Compute the Hessian and gradient using a polynomial approximation.
+        
+        Fits a second-order polynomial to a dense grid of points around the
+        desired location, then computes the Hessian matrix and gradient vector
+        from the coefficients of that polynomial. The coefficients are fit using
+        linear least squares.
+        
+        Parameters
+        ----------
+        params : array of float
+            The free parameters to find the Hessian and gradient at.
+        stepsize : float or array of float, optional
+            The stepsize(s) to use for each parameter. The default is to pick
+            something of order `epsilon**(1.0 / 3.0) * params`.
+        numsteps : int, optional
+            The number of steps away from the center to take. Default is 2.
+        pool : :py:class:`Pool` instance, optional
+            The pool to use when evaluating the log-posterior at each point.
+            Default is to do this in serial.
+        """
+        params = scipy.asarray(params, dtype=float)
+        if stepsize is None:
+            params_t = params.copy()
+            params_t[scipy.absolute(params_t) <= 1e-4] = 1e-4
+            temp = params_t * (1.0 + (sys.float_info.epsilon)**(1.0 / 3.0))
+            stepsize = temp - params_t
+        
+        stepsize = scipy.asarray(stepsize, dtype=float)
+        if stepsize.ndim == 0:
+            stepsize = stepsize * scipy.ones_like(params)
+        
+        # Form the grids:
+        grid_base = stepsize[:, None] * scipy.asarray(range(-numsteps, numsteps + 1), dtype=float)[None, :]
+        grids = params[:, None] + grid_base
+        dense_grids = scipy.meshgrid(*grids)
+        X = scipy.vstack([dg.ravel() for dg in dense_grids]).T
+        
+        # Form the polynomial features up to order 2:
+        poly = PolynomialFeatures(2)
+        X_poly = poly.fit_transform(X - params[None, :])
+        
+        # Evaluate at each value of X:
+        ev = _ComputeLnProbWrapper(self, make_dir=pool is not None)
+        if pool is None:
+            z = map(ev, X)
+        else:
+            z = pool.map(ev, X)
+        z = scipy.asarray(z, dtype=float)
+        
+        # Mask the bad/out-of-bounds points:
+        good_pts = (~scipy.isnan(z)) & (~scipy.isinf(z))
+        
+        # Fit the polynomial:
+        coeffs, res, rank, s = scipy.linalg.lstsq(X_poly[good_pts, :], z[good_pts])
+        
+        # Form the Hessian matrix:
+        H = scipy.zeros((len(params), len(params)))
+        for i in range(0, len(params)):
+            # Diagonal:
+            mask = scipy.zeros(len(params))
+            mask[i] = 2
+            H[i, i] = 2.0 * coeffs[(poly.powers_ == mask).all(axis=1)]
+            # Off-diagonal:
+            for j in range(i + 1, len(params)):
+                mask = scipy.zeros(len(params))
+                mask[i] = 1
+                mask[j] = 1
+                H[i, j] = coeffs[(poly.powers_ == mask).all(axis=1)]
+                H[j, i] = H[i, j]
+        
+        # Form the gradient vector:
+        g = scipy.zeros(len(params))
+        for i in range(0, len(params)):
+            mask = scipy.zeros(len(params))
+            mask[i] = 1
+            g[i] = coeffs[(poly.powers_ == mask).all(axis=1)]
+        
+        return H, g
     
     # Routines for multinest:
     def multinest_prior(self, cube, ndim, nparams):
@@ -3506,6 +3627,7 @@ class Run(object):
         lnew : float
             New log-likelihood. Probably just there for FORTRAN compatibility?
         """
+        ll = -scipy.inf
         acquire_working_dir(lockmode='file')
         try:
             c = [cube[i] for i in range(0, ndim)]
@@ -3513,6 +3635,8 @@ class Run(object):
             local_sig = self.cs_den2local_sigs(cs_den, sqrtpsinorm, time)
             local_diffs = self.local_sig2local_diffs(local_sig)
             ll = self.local_diffs2ln_prob(local_diffs, no_prior=True)
+        except:
+            warnings.warn("Something went wrong with STRAHL!")
         finally:
             release_working_dir(lockmode='file')
         return ll
@@ -3531,10 +3655,13 @@ class Run(object):
         lnew : float
             New log-likelihood. Probably just there for FORTRAN compatibility?
         """
+        ll = -scipy.inf
         acquire_working_dir(lockmode='file')
         try:
             c = [cube[i] for i in range(0, ndim)]
             ll = self.DV2ln_prob(params=c, no_prior=True)
+        except:
+            warnings.warn("Something went wrong with STRAHL!")
         finally:
             release_working_dir(lockmode='file')
         return ll
@@ -3547,11 +3674,11 @@ class Run(object):
         chains_dir = os.path.dirname(basename)
         if chains_dir and not os.path.exists(chains_dir):
             os.mkdir(chains_dir)
-        progress = pymultinest.ProgressPrinter(
-            n_params=(~self.fixed_params).sum(),
-            outputfiles_basename=basename
-        )
-        progress.start()
+        # progress = pymultinest.ProgressPrinter(
+        #     n_params=(~self.fixed_params).sum(),
+        #     outputfiles_basename=basename
+        # )
+        # progress.start()
         pymultinest.run(
             self.multinest_ll_local if local else self.multinest_ll_lineintegral,
             self.multinest_prior,
@@ -3560,7 +3687,7 @@ class Run(object):
             n_live_points=n_live_points,
             **kwargs
         )
-        progress.stop()
+        # progress.stop()
     
     def process_multinest(self, basename=None, cutoff_weight=0.1, **kwargs):
         if basename is None:
@@ -3988,10 +4115,20 @@ class Run(object):
         
         # Compute the Hessian at the best result:
         print("Estimating Hessian matrix...")
-        H = self.DV2hessian(params=res_min[0])
-        # nd.Hessian does not respect bounds!
-        # H = nd.Hessian(lambda p: self.DV2ln_prob(params=p, use_local=use_local))(res_min[0])
-        cov_min = scipy.linalg.inv(-H)
+        # H = self.DV2hessian(params=res_min[0])
+        # nd.Hessian does not respect bounds! So, I will try to use the MaxStepGenerator.
+        lower_dist = res_min[0] - self.free_param_bounds[:, 0]
+        upper_dist = self.free_param_bounds[:, 1] - res_min[0]
+        max_step = min(lower_dist.min(), upper_dist.min())
+        if max_step < scipy.sqrt(sys.float_info.epsilon):
+            warnings.warn("A parameter is too close to the bounds, could not compute Hessian!")
+            cov_min = None
+        else:
+            H = nd.Hessian(
+                lambda p: self.DV2ln_prob(params=p, use_local=use_local),
+                step=nd.MaxStepGenerator(step_ratio=None, num_extrap=14, step_max=max_step)
+            )(res_min[0])
+            cov_min = scipy.linalg.inv(-H)
         
         # Estimate the AIC and BIC at the best result:
         # (This is technically a kludge, because they are supposed to be at the
@@ -7830,8 +7967,8 @@ class _ComputeLnProbWrapper(object):
             if self.make_dir:
                 acquire_working_dir()
             out = self.run.DV2ln_prob(
-                params,
-                sign=(-1 if self.for_min else 1),
+                params=params,
+                sign=(-1.0 if self.for_min else 1.0),
                 **kwargs
             )
         except:
@@ -8073,22 +8210,50 @@ class _OptimizeEval(object):
             #     iprint=50,
             #     maxfun=50000
             # )
-            opt = nlopt.opt(nlopt.LN_SBPLX, len(params))
+            
+            # First run a global optimizer:
+            opt = nlopt.opt(nlopt.GN_DIRECT_L, len(params))  # LN_SBPLX
             opt.set_max_objective(self.run.u2ln_prob_local if self.use_local else self.run.u2ln_prob)
             opt.set_lower_bounds([0.0,] * opt.get_dimension())
             opt.set_upper_bounds([1.0,] * opt.get_dimension())
             # opt.set_ftol_abs(1.0)
-            opt.set_ftol_rel(1e-8)
+            opt.set_ftol_rel(1e-6)
             # opt.set_maxeval(40000)#(100000)
             opt.set_maxtime(3600 * 12)
             p0 = self.run.params.copy()
             p0[~self.run.fixed_params] = params
             uopt = opt.optimize(self.run.get_prior().elementwise_cdf(p0)[~self.run.fixed_params])
+            
+            # Then polish the minimum:
+            print("Polishing with SUBPLEX...")
+            opt = nlopt.opt(nlopt.LN_SBPLX, len(params))
+            opt.set_max_objective(self.run.u2ln_prob_local if self.use_local else self.run.u2ln_prob)
+            opt.set_lower_bounds([0.0,] * opt.get_dimension())
+            opt.set_upper_bounds([1.0,] * opt.get_dimension())
+            opt.set_ftol_rel(1e-8)
+            opt.set_maxtime(3600 * 12)
+            uopt = opt.optimize(uopt)
+            
             # Convert uopt back to params:
             u_full = 0.5 * scipy.ones_like(self.run.params, dtype=float)
             u_full[~self.run.fixed_params] = uopt
             p_opt = self.run.get_prior().sample_u(u_full)[~self.run.fixed_params]
+            
+            # Polish optimum again with L-BFGS-B, hopefully eventually get H:
+            # print("Polishing with L-BFGS-B...")
+            # p_opt, f_opt, d_res = scipy.optimize.fmin_l_bfgs_b(
+            #     self.run.DV2ln_prob,
+            #     p_opt,
+            #     fprime=self.run.DV2jac,
+            #     args=(-1.0,),
+            #     bounds=scipy.asarray(self.run.get_prior().bounds[:], dtype=float)[~self.run.fixed_params],
+            #     m=100,
+            #     factr=1e7,
+            #     # maxls=100
+            # )
+            
             out = (p_opt, opt.last_optimum_value(), opt.last_optimize_result(), NUM_STRAHL_CALLS)
+            # out = (p_opt, f_opt, (opt.last_optimize_result(), d_res), NUM_STRAHL_CALLS)
             print("Done. Made %d calls to STRAHL." % (NUM_STRAHL_CALLS,))
             return out
         except:
