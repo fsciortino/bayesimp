@@ -9155,7 +9155,7 @@ class VuvLineFrame(tk.Frame):
         # TODO: This should save the current state into the selected line
         
         try:
-            self.idx = self.listbox.curselection()[0]
+            self.idx = int(self.listbox.curselection()[0])
         except IndexError:
             self.idx = None
         
