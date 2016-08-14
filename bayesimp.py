@@ -7825,7 +7825,7 @@ class XTOMOData(object):
         N = tree.getNode('brightnesses.array_{a_n:d}.chord_01'.format(a_n=array_num))
         try:
             t = scipy.asarray(N.dim_of().data(), dtype=float)
-        except MDSplus.TdiException:
+        except:
             warnings.warn(
                 "No data for XTOMO {a_n:d}!".format(a_n=array_num),
                 RuntimeWarning
