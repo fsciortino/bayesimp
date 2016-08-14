@@ -1988,6 +1988,8 @@ class Run(object):
             return scipy.nan
         
         # Evaluate ne, Te:
+        # TODO: Can probably speed things up by caching this when using fixed
+        # values!
         ne_in = self.run_data.ne_p.gp.draw_sample(
             self.run_data.ne_X,
             rand_vars=scipy.atleast_2d(eig_ne).T,
@@ -2017,6 +2019,8 @@ class Run(object):
                 time_2_override = None
             else:
                 time_2_override = self.time_1 + 0.2
+            # TODO: Can probably speed things up by not re-writing the control
+            # and pp files if they aren't changing!
             self.write_control(time_2_override=time_2_override)
             self.write_pp(
                 scipy.sqrt(self.psinorm_grid),
@@ -7008,18 +7012,8 @@ class RunData(object):
     
     Performs the following operations:
     
-    * Loads the HiReX-SR data from run_data.sav (previously produced with a
-      call to :py:meth:`Run.setup_files`).
-    * Launches a GUI to let the user flag bad points in the HiReX-SR data.
-    * Launches a GUI to let the user select the diagnostic lines to use for the
-      XEUS instrument. EACH LINE CAN ONLY HAVE ONE CHARGE STATE, OR STRAHL WILL
-      BREAK!
-    * Launches a GUI to do the same for the LoWEUS instrument.
-    * Writes Ca.atomdat to reflect the desired spectral lines.
     * Launches gpfit for the user to fit the Te profile.
     * Launches gpfit for the user to fit the ne profile.
-    * Bins the data into injections and normalizes according to the
-      GP-interpolated maximum.
     
     Parameters
     ----------
@@ -8229,17 +8223,17 @@ class _OptimizeEval(object):
             # )
             
             # First run a global optimizer:
-            opt = nlopt.opt(nlopt.GN_DIRECT_L, len(params))  # LN_SBPLX
-            opt.set_max_objective(self.run.u2ln_prob_local if self.use_local else self.run.u2ln_prob)
-            opt.set_lower_bounds([0.0,] * opt.get_dimension())
-            opt.set_upper_bounds([1.0,] * opt.get_dimension())
-            # opt.set_ftol_abs(1.0)
-            opt.set_ftol_rel(1e-6)
-            # opt.set_maxeval(40000)#(100000)
-            opt.set_maxtime(3600 * 12)
-            p0 = self.run.params.copy()
-            p0[~self.run.fixed_params] = params
-            uopt = opt.optimize(self.run.get_prior().elementwise_cdf(p0)[~self.run.fixed_params])
+            # opt = nlopt.opt(nlopt.GN_DIRECT_L, len(params))  # LN_SBPLX
+            # opt.set_max_objective(self.run.u2ln_prob_local if self.use_local else self.run.u2ln_prob)
+            # opt.set_lower_bounds([0.0,] * opt.get_dimension())
+            # opt.set_upper_bounds([1.0,] * opt.get_dimension())
+            # # opt.set_ftol_abs(1.0)
+            # opt.set_ftol_rel(1e-6)
+            # # opt.set_maxeval(40000)#(100000)
+            # opt.set_maxtime(3600 * 12)
+            # p0 = self.run.params.copy()
+            # p0[~self.run.fixed_params] = params
+            # uopt = opt.optimize(self.run.get_prior().elementwise_cdf(p0)[~self.run.fixed_params])
             
             # Then polish the minimum:
             print("Polishing with SUBPLEX...")
@@ -8249,7 +8243,8 @@ class _OptimizeEval(object):
             opt.set_upper_bounds([1.0,] * opt.get_dimension())
             opt.set_ftol_rel(1e-8)
             opt.set_maxtime(3600 * 12)
-            uopt = opt.optimize(uopt)
+            # uopt = opt.optimize(uopt)
+            uopt = opt.optimize(self.run.get_prior().elementwise_cdf(p0)[~self.run.fixed_params])
             
             # Convert uopt back to params:
             u_full = 0.5 * scipy.ones_like(self.run.params, dtype=float)
