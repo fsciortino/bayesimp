@@ -8231,8 +8231,8 @@ class _OptimizeEval(object):
             # opt.set_ftol_rel(1e-6)
             # # opt.set_maxeval(40000)#(100000)
             # opt.set_maxtime(3600 * 12)
-            # p0 = self.run.params.copy()
-            # p0[~self.run.fixed_params] = params
+            p0 = self.run.params.copy()
+            p0[~self.run.fixed_params] = params
             # uopt = opt.optimize(self.run.get_prior().elementwise_cdf(p0)[~self.run.fixed_params])
             
             # Then polish the minimum:
