@@ -405,6 +405,10 @@ def finalize_pool(pool):
     # know a better way to ensure this.
     dum = [1] * (4 * pool._processes)
     pool.map(cleanup_working_dir, dum)
+    # Blank out the list of available directories:
+    with DIR_POOL_LOCK:
+        f = open(os.path.join(MASTER_DIR, 'working_dirs.txt'), 'w')
+        f.close()
 
 def make_pool(num_proc=None):
     """Create and return a pool.
