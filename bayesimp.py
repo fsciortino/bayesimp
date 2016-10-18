@@ -5448,7 +5448,9 @@ class Run(object):
         a.set_xlabel('step')
         a.set_ylabel('-log-posterior')
     
-    def compute_marginalized_DV(self, sampler, burn=0, thin=1, chain_mask=None, pool=None, weights=None, cutoff_weight=None, plot=False):
+    def compute_marginalized_DV(self, sampler, burn=0, thin=1, chain_mask=None,
+                                pool=None, weights=None, cutoff_weight=None,
+                                plot=False, compute_VD=False):
         """Computes and plots the marginal D, V profiles.
         
         Parameters
@@ -5467,6 +5469,8 @@ class Run(object):
             The log-probability. Only to be passed if `sampler` is an array.
         pool : object with `map` method, optional
             Multiprocessing pool to use. If None, `sampler.pool` will be used.
+        compute_VD : bool, optional
+            If True, compute and return V/D in addition to D and V.
         """
         if pool is None:
             try:
@@ -5537,6 +5541,11 @@ class Run(object):
         V_mean = profiletools.meanw(V_samp[~bad], axis=0)
         V_std = profiletools.stdw(V_samp[~bad], axis=0, ddof=1, weights=weights)
         
+        if compute_VD:
+            VD_samp = DV_samp[:, 1, :] / DV_samp[:, 0, :]
+            VD_mean = profiletools.meanw(VD_samp[~bad], axis=0, weights=weights)
+            VD_std = profiletools.stdw(VD_samp[~bad], axis=0, ddof=1)
+        
         if plot:
             f_DV = plt.figure()
             f_DV.suptitle('Marginalized Ca transport coefficient profiles')
@@ -5564,7 +5573,7 @@ class Run(object):
             a_V.set_xlabel('$r/a$')
             a_V.set_ylabel('$V$ [m/s]')
         
-        return (D_mean, D_std, V_mean, V_std)
+        return (D_mean, D_std, V_mean, V_std, VD_mean, VD_std) if compute_VD else (D_mean, D_std, V_mean, V_std)
     
     def plot_marginalized_brightness(self, sampler, burn=0, thin=1, chain_mask=None):
         """Averages the brightness histories over all samples/chains and makes a plot.
