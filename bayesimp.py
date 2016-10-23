@@ -5450,7 +5450,7 @@ class Run(object):
     
     def compute_marginalized_DV(self, sampler, burn=0, thin=1, chain_mask=None,
                                 pool=None, weights=None, cutoff_weight=None,
-                                plot=False, compute_VD=False):
+                                plot=False, compute_VD=False, compute_M=False):
         """Computes and plots the marginal D, V profiles.
         
         Parameters
@@ -5465,12 +5465,20 @@ class Run(object):
         chain_mask : mask array
             The chains to keep when computing the marginalized D, V profiles.
             Default is to use all chains.
-        lp : array, optional
-            The log-probability. Only to be passed if `sampler` is an array.
         pool : object with `map` method, optional
             Multiprocessing pool to use. If None, `sampler.pool` will be used.
+        weights : array of float, optional
+            The weights to use (i.e., when post-processing MultiNest output).
+        cutoff_weight : float, optional
+            Throw away any points with weights lower than `cutoff_weight` times
+            `weights.max()`. Default is to keep all points.
+        plot : bool, optional
+            If True, make a plot of D and V.
         compute_VD : bool, optional
             If True, compute and return V/D in addition to D and V.
+        compute_M : bool, optional
+            If True, compute the Mahalanobis distance between the marginalized
+            D and V and `self.explicit_D`, `self.explicit_V`.
         """
         if pool is None:
             try:
@@ -5546,6 +5554,23 @@ class Run(object):
             VD_mean = profiletools.meanw(VD_samp[~bad], axis=0, weights=weights)
             VD_std = profiletools.stdw(VD_samp[~bad], axis=0, ddof=1)
         
+        if compute_M:
+            # First, interpolate the true profiles onto the correct D, V grid:
+            D_point = scipy.interpolate.InterpolatedUnivariateSpline(
+                self.explicit_D_grid, self.explicit_D
+            )(scipy.sqrt(self.psinorm_grid_DV))
+            V_point = scipy.interpolate.InterpolatedUnivariateSpline(
+                self.explicit_V_grid, self.explicit_V
+            )(scipy.sqrt(self.psinorm_grid_DV))
+            DV_point = scipy.hstack((D_point, V_point))
+            DV = scipy.hstack((DV_samp[:, 0, :], DV_samp[:, 1, :]))
+            mu_DV = scipy.hstack((D_mean, V_mean))
+            DV_point = scipy.hstack((self.explicit_D, self.explicit_V))
+            cov_DV = scipy.cov(DV, rowvar=False, aweights=weights)
+            L = scipy.linalg.cholesky(cov_DV + 1000 * sys.float_info.epsilon * scipy.eye(*cov_DV.shape), lower=True)
+            y = scipy.linalg.solve_triangular(L, DV_point - mu_DV, lower=True)
+            M = y.T.dot(y)
+        
         if plot:
             f_DV = plt.figure()
             f_DV.suptitle('Marginalized Ca transport coefficient profiles')
@@ -5573,7 +5598,13 @@ class Run(object):
             a_V.set_xlabel('$r/a$')
             a_V.set_ylabel('$V$ [m/s]')
         
-        return (D_mean, D_std, V_mean, V_std, VD_mean, VD_std) if compute_VD else (D_mean, D_std, V_mean, V_std)
+        out = [D_mean, D_std, V_mean, V_std]
+        if compute_VD:
+            out += [VD_mean, VD_std]
+        if compute_M:
+            out += [M,]
+        
+        return tuple(out)
     
     def plot_marginalized_brightness(self, sampler, burn=0, thin=1, chain_mask=None):
         """Averages the brightness histories over all samples/chains and makes a plot.
