@@ -226,7 +226,7 @@ def get_idl_session():
     """
     global IDL_SESSION
     if IDL_SESSION is None:
-        IDL_SESSION = pexpect.spawn('idl')
+        IDL_SESSION = pexpect.spawn('idl70')
         # Use the following line for debugging:
         # IDL_SESSION.logfile = sys.stdout
         IDL_SESSION.expect('IDL> ')
@@ -6015,7 +6015,7 @@ class Run(object):
         print("Running setup_strahl_run...")
         os.chdir(new_dir)
         if not os.path.isfile('run_data.sav'):
-            cmd = "idl <<EOF\n.compile setup_strahl_run.pro\nsetup_strahl_run, {shot}, {time_1}, {time_2}".format(
+            cmd = "idl70 <<EOF\n.compile setup_strahl_run.pro\nsetup_strahl_run, {shot}, {time_1}, {time_2}".format(
                 shot=self.shot,
                 time_1=self.time_1,
                 time_2=self.time_2
