@@ -2191,11 +2191,11 @@ class Run(object):
                     atomdat[2]
                 ):
                 dlines[:, i, :] = compute_emiss(
-                    self.PEC[chg],
+                    self.PEC[int(chg)],
                     cw,
                     hw,
                     ne,
-                    cs_den[:, chg, :],
+                    cs_den[:, int(chg), :],
                     Te
                 )
             # Compute the emissivity seen through the core XTOMO filters:
