@@ -577,9 +577,8 @@ class Run(object):
         for all parameters to be free.
     initial_params : array of bool, (`num_params`,), optional
         Initial values for all of the parameters (both free and fixed). Default
-        is to use `params_true` if it is provided, or a random draw from the
-        prior distribution. This exists primarily as a mechanism to set the
-        values of fixed parameters.
+        is to use `params_true` if it is provided, or benign defaults. This
+        exists primarily as a mechanism to set the values of fixed parameters.
     D_lb : float, optional
         The lower bound on the diffusion coefficient parameters. Default is 0.0.
     D_ub : float, optional
@@ -1126,7 +1125,43 @@ class Run(object):
         elif params_true is not None:
             self.params = self.params_true.copy()
         else:
+            # Get the structure with a random draw (this sets D, V):
             self.params = self.get_prior().random_draw()
+            # TODO: This is pretty hackish, can probably be done more cleanly...
+            nD = self.num_eig_D
+            nV = self.num_eig_V
+            kD = self.spline_k_D
+            kV = self.spline_k_V
+            nkD = self.num_eig_D - self.spline_k_D
+            nkV = self.num_eig_V - self.spline_k_V
+            # Number of signals (determines number of scaling parameters):
+            nS = 0
+            for s in self.signals:
+                if s is not None:
+                    nS += len(scipy.unique(s.blocks))
+            # Number of diagnostics (determines number of time shifts):
+            nDiag = len(self.signals)
+            knots_D = scipy.linspace(0, 1.05, nkD + 2)[1:-1]
+            knots_V = scipy.linspace(0, 1.05, nkV + 2)[1:-1]
+            # Set each class of param to a benign default:
+            # Knots for D:
+            self.params[nD + nV:nD + nV + nkD] = knots_D
+            # Knots for V:
+            self.params[nD + nV + nkD:nD + nV + nkD + nkV] = knots_V
+            # Scaling factors:
+            self.params[nD + nV + nkD + nkV:nD + nV + nkD + nkV + nS] = 1.0
+            # Time shifts:
+            self.params[nD + nV + nkD + nkV + nS:nD + nV + nkD + nkV + nS + nDiag] = 0.0
+            # ne eigenvalues:
+            self.params[
+                nD + nV + nkD + nkV + nS + nDiag:
+                nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne
+            ] = 0.0
+            # Te eigenvalues:
+            self.params[
+                nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne:
+                nD + nV + nkD + nkV + nS + nDiag + self.num_eig_ne + self.num_eig_Te
+            ] = 0.0
         
         # Handle the fixed params:
         if fixed_params is not None:
